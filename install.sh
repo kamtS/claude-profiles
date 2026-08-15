@@ -86,6 +86,19 @@ if [ "$src_dir/claude-profiles.sh" != "$TARGET" ]; then
     cp "$src_dir/claude-profiles.sh" "$TARGET"
 fi
 
+# The status line renderer. This is what makes a wrong profile visible rather
+# than silent, so treat a failure to install it as fatal.
+if [ -f "$src_dir/bin/profile-status.sh" ]; then
+    mkdir -p "$INSTALL_DIR/bin"
+    if [ "$src_dir/bin/profile-status.sh" != "$INSTALL_DIR/bin/profile-status.sh" ]; then
+        cp "$src_dir/bin/profile-status.sh" "$INSTALL_DIR/bin/profile-status.sh"
+    fi
+    chmod +x "$INSTALL_DIR/bin/profile-status.sh"
+else
+    echo "install.sh: bin/profile-status.sh not found next to this script" >&2
+    exit 1
+fi
+
 if [ -f "$RC" ] && grep -qF "$MARKER" "$RC"; then
     echo "Already installed in $RC (script refreshed)."
 else
@@ -105,13 +118,41 @@ else
     fi
 fi
 
+# Our wrapper is a shell function, so whoever defines `claude` LAST wins. A
+# Claude Code update that appends its own alias or function to the rc is the
+# most likely way this silently stops working — and the symptom is not an
+# error, it is every session quietly running the default profile.
+if [ -f "$RC" ] && grep -qF "$MARKER_END" "$RC"; then
+    if awk -v e="$MARKER_END" '
+        $0 == e { after = 1; next }
+        after && /(alias|function)[[:space:]]+claude([[:space:]]|=|\()/ { found = 1 }
+        after && /^[[:space:]]*claude[[:space:]]*\(\)/ { found = 1 }
+        END { exit !found }
+    ' "$RC"; then
+        echo
+        echo "WARNING: something after the claude-profiles block in $RC also"
+        echo "defines 'claude'. It will win, and 'claude -<name>' will silently"
+        echo "run the default profile. Move the claude-profiles block below it,"
+        echo "then confirm with: claude-profile doctor"
+    fi
+fi
+
 cat <<EOF
 
 Installed to $TARGET
+Status line renderer: $INSTALL_DIR/bin/profile-status.sh
 
 Next steps:
   exec \$SHELL                 reload your shell
+  claude-profile repair       wire up the status line, so every session
+                              shows which profile it is billing
   claude-profile new work     create a profile and log into it
   claude -work                run Claude Code as that profile
   claude-profile ls           see every profile and its account
+  claude-profile doctor       check it all still works after an update
+  claude-profile audit        check shared config carries no credentials
+
+In scripts and cron, where your shell rc is never sourced, the 'claude -work'
+prefix does not exist. Use this instead, or you will bill the default profile:
+  claude-profile exec work -- claude -p '...'
 EOF

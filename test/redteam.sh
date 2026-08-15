@@ -11,6 +11,7 @@
 set -uo pipefail
 
 SRC="$(cd "$(dirname "$0")/.." && pwd)/claude-profiles.sh"
+STATUS_BIN="$(cd "$(dirname "$0")/.." && pwd)/bin/profile-status.sh"
 FAILURES=0
 
 pass() { printf '  ok    %s\n' "$1"; }
@@ -55,10 +56,16 @@ run_suite() {
     echo "OUTSIDE_CANARY" > "$SB/OUTSIDE/canary.txt"
     echo '{"oauthAccount":{"emailAddress":"default@example.com"}}' > "$SB/home/.claude.json"
 
-    # Stub CLI: reports the config dir it was handed.
+    # Stub CLI: reports the config dir and profile it was handed. Also answers
+    # --help, because the wrapper consults it before rejecting an unknown
+    # -<name> — and advertises a hypothetical single-dash multi-char flag so
+    # the "don't break a future flag" path is exercised.
     cat > "$SB/bin/claude" <<'STUB'
 #!/usr/bin/env bash
-echo "STUB|CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-<unset>}|args:$*"
+echo "STUB|CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-<unset>}|args:$*|profile=${CLAUDE_PROFILE:-<unset>}"
+if [ "${1:-}" = "--help" ]; then
+    printf 'Options:\n  -c, --continue\n  -p, --print\n  -fast, --fast-mode  hypothetical\n'
+fi
 STUB
     chmod +x "$SB/bin/claude"
 
@@ -172,6 +179,103 @@ $1" 2>&1
     assert_not_contains "python3 really is absent" "python3-was-found" \
         "$(PATH="$SB/minbin:$SB/bin" command -v python3 >/dev/null 2>&1 && echo python3-was-found)"
     assert_contains "grep fallback finds email" "fallback@example.com" "$out"
+
+    # The deletion section above removed "work"; recreate it for what follows.
+    run "claude-profile new work </dev/null" >/dev/null 2>&1
+
+    printf '\n-- no silent fallback to the default profile --\n'
+    # The whole point: a mistyped or missing profile must never quietly run
+    # the default account, because that bills the wrong client.
+    out=$(run "claude -nosuchprofile chat; echo exit=\$?")
+    assert_contains "unknown profile exits 2" "exit=2" "$out"
+    assert_not_contains "unknown profile never reaches the CLI" "STUB|" "$out"
+    assert_contains "unknown profile explains itself" "Refusing to fall back" "$out"
+
+    # ...but a genuine flag we have never heard of must still work, so a future
+    # Claude Code release cannot be broken by this check.
+    out=$(run "claude -fast chat")
+    assert_contains "unknown-but-real flag passes through" "args:-fast chat" "$out"
+
+    printf '\n-- profile is announced --\n'
+    out=$(run "claude -work chat")
+    assert_contains "banner names the profile" "claude-profiles: work" "$out"
+    assert_contains "CLAUDE_PROFILE exported to the child" "profile=work" "$out"
+    out=$(run "CLAUDE_PROFILE_QUIET=1 claude -work chat")
+    assert_not_contains "banner suppressible" "claude-profiles: work" "$out"
+    out=$(run "claude -work chat 2>/dev/null")
+    assert_not_contains "banner goes to stderr, not stdout" "claude-profiles: work" "$out"
+
+    printf '\n-- exec: the scripted path --\n'
+    out=$(run "claude-profile exec work -- claude -p hi")
+    assert_contains "exec sets the config dir" "/.claude-profiles/work|args:-p hi" "$out"
+    out=$(run "claude-profile exec nope -- claude; echo exit=\$?")
+    assert_contains "exec rejects unknown profile" "exit=2" "$out"
+
+    printf '\n-- status line --\n'
+    mkdir -p "$SB/home/.claude-profiles/work/projects/-slug"
+    echo '{"oauthAccount":{"emailAddress":"work@example.com"}}' \
+        > "$SB/home/.claude-profiles/work/.claude.json"
+    sl() {
+        printf '{"transcript_path":"%s","cost":{"total_cost_usd":1.5},"rate_limits":{"five_hour":{"used_percentage":34},"seven_day":{"used_percentage":88}}}' "$1" |
+            HOME="$SB/home" CLAUDE_CONFIG_DIR="${2:-}" sh "$STATUS_BIN" 2>&1
+    }
+    out=$(sl "$SB/home/.claude-profiles/work/projects/-slug/x.jsonl" "$SB/home/.claude-profiles/work")
+    assert_contains "status line names the profile" "work" "$out"
+    assert_contains "status line shows the account" "work@example.com" "$out"
+    assert_contains "status line uses the 5h window, not the 7d one" "34%" "$out"
+    assert_not_contains "status line does not show the 7d window" "88%" "$out"
+
+    mkdir -p "$SB/home/.claude/projects/-slug"
+    out=$(sl "$SB/home/.claude/projects/-slug/x.jsonl" "")
+    assert_contains "unprofiled session reads as default" "default" "$out"
+
+    # The tripwire: launcher says one profile, Claude Code is writing to another.
+    out=$(sl "$SB/home/.claude/projects/-slug/x.jsonl" "$SB/home/.claude-profiles/work")
+    assert_contains "mismatch is loud" "PROFILE MISMATCH" "$out"
+    assert_contains "mismatch names who is really billed" "billing=default" "$out"
+
+    out=$(printf '' | HOME="$SB/home" sh "$STATUS_BIN" 2>&1)
+    assert_contains "status line survives empty stdin" "default" "$out"
+    out=$(printf 'not json' | HOME="$SB/home" sh "$STATUS_BIN" 2>&1)
+    assert_not_contains "status line survives junk stdin" "error" "$out"
+
+    printf '\n-- audit --\n'
+    out=$(run "claude-profile audit; echo exit=\$?")
+    assert_contains "clean audit exits 0" "exit=0" "$out"
+    printf 'key sk-ant-api03-AAAAAAAAAAAAAAAAAAAA\n' > "$SB/home/.claude/skills/leak.txt"
+    out=$(run "claude-profile audit; echo exit=\$?")
+    assert_contains "audit finds a planted credential" "hard-coded credential pattern" "$out"
+    assert_contains "dirty audit exits 1" "exit=1" "$out"
+    assert_not_contains "audit never prints the secret itself" "sk-ant-api03-AAAA" "$out"
+    rm -f "$SB/home/.claude/skills/leak.txt"
+
+    printf '\n-- doctor and repair survive an un-shared settings file --\n'
+    # Exactly what an atomic temp-file-plus-rename settings write leaves
+    # behind: the symlink is gone and the profile silently stopped sharing.
+    rm -f "$SB/home/.claude-profiles/work/settings.json"
+    echo '{"diverged":true}' > "$SB/home/.claude-profiles/work/settings.json"
+    out=$(run "claude-profile doctor; echo exit=\$?")
+    assert_contains "doctor spots the un-shared file" "UNSHARED settings.json" "$out"
+    assert_contains "doctor exits non-zero on problems" "exit=1" "$out"
+
+    out=$(run "claude-profile repair --all")
+    assert_contains "repair relinks it" "relinked settings.json" "$out"
+    out=$(run "test -L \"\$CLAUDE_PROFILES_DIR/work/settings.json\" && echo IS_LINK")
+    assert_contains "settings.json is a symlink again" "IS_LINK" "$out"
+    out=$(run "cat \"\$CLAUDE_PROFILES_DIR/work\"/settings.json.unshared-*")
+    assert_contains "repair keeps the diverged copy" "diverged" "$out"
+
+    out=$(run "claude-profile repair --all")
+    assert_contains "repair is idempotent" "already correct" "$out"
+    out=$(run "ls \"\$CLAUDE_PROFILES_DIR/work\" | grep -c unshared")
+    assert_contains "repair did not pile up backups" "1" "$out"
+
+    printf '\n-- bin/ is not a profile --\n'
+    mkdir -p "$SB/home/.claude-profiles/bin"
+    out=$(run "claude-profile ls")
+    assert_not_contains "ls does not list bin as a profile" "-bin" "$out"
+    out=$(run "claude-profile new bin </dev/null; echo exit=\$?")
+    assert_contains "cannot create a profile named bin" "exit=1" "$out"
 
     printf '\n-- usage --\n'
     out=$(run "claude-profile bogus; echo exit=\$?")

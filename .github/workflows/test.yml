@@ -34,3 +34,16 @@ jobs:
           shellcheck -s bash install.sh test/redteam.sh
           # The completion blocks are shell-specific by design.
           shellcheck -s bash -e SC2296,SC3030,SC2206,SC2128,SC2086 claude-profiles.sh
+          # The status line renderer is strict POSIX sh: it runs on every
+          # status line render, so it must not pay interpreter startup.
+          shellcheck -s sh bin/profile-status.sh
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Nothing in the shared defaults may carry credentials
+        run: |
+          mkdir -p "$HOME/.claude"
+          . ./claude-profiles.sh
+          claude-profile audit
