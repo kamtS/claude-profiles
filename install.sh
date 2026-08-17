@@ -137,6 +137,47 @@ if [ -f "$RC" ] && grep -qF "$MARKER_END" "$RC"; then
     fi
 fi
 
+# A SECOND copy of claude-profiles sourced from somewhere else in the same rc.
+# The check above deliberately only looks after our block, because only a later
+# definition can win — but a second copy sourced EARLIER is its own trap. It
+# will not misroute a profile: ours is appended last, so ours wins. The other
+# file just quietly becomes a decoy, still sourced, always overridden, never
+# erroring. Edit it expecting a deploy and nothing at all happens.
+if [ -f "$RC" ]; then
+    # Every distinct token containing a slash on a `source`/`.` line. sort -u
+    # because a guarded source names the same path twice on one line:
+    #   [ -f "$HOME/x.zsh" ] && source "$HOME/x.zsh"
+    grep -E '^[^#]*([[:space:];&]|^)(\.|source)[[:space:]]' "$RC" 2>/dev/null |
+        tr '[:blank:]' '\n' | tr -d "\"'" | sort -u |
+        while IFS= read -r candidate; do
+            case "$candidate" in
+                */*) ;;
+                *) continue ;;
+            esac
+            # Expand the forms an rc realistically uses. The single quotes are
+            # deliberate: these are literal patterns to match, not expansions.
+            # shellcheck disable=SC2016
+            case "$candidate" in
+                '$HOME'/*) candidate="$HOME/${candidate#\$HOME/}" ;;
+                '${HOME}'/*) candidate="$HOME/${candidate#\$\{HOME\}/}" ;;
+                '~'/*) candidate="$HOME/${candidate#\~/}" ;;
+            esac
+            [ -f "$candidate" ] || continue
+            [ "$candidate" = "$TARGET" ] && continue
+            # Our signature: an internal only this project defines.
+            grep -q '_claude_profile_valid_name' "$candidate" 2>/dev/null || continue
+            echo
+            echo "WARNING: $RC also sources another copy of claude-profiles:"
+            echo "  $candidate"
+            echo "Ours is sourced last so it wins, but that file is now a decoy:"
+            echo "still loaded, always overridden, and silent about it. Editing it"
+            echo "will look like a deploy and change nothing."
+            echo "Fix: delete it and remove its source line, or point that line at"
+            echo "  $TARGET"
+            echo "Then confirm with: claude-profile doctor"
+        done
+fi
+
 cat <<EOF
 
 Installed to $TARGET
