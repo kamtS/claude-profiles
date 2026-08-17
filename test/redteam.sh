@@ -229,6 +229,18 @@ $1" 2>&1
     out=$(sl "$SB/home/.claude/projects/-slug/x.jsonl" "")
     assert_contains "unprofiled session reads as default" "default" "$out"
 
+    # Subagent transcripts nest deeper than a session's own:
+    #   <config>/projects/<slug>/<uuid>/subagents/agent-<id>.jsonl
+    # Counting directories back up from the file resolves to the wrong config
+    # dir at that depth, which mislabels the profile and can fire a false
+    # mismatch — so depth must not matter.
+    out=$(sl "$SB/home/.claude-profiles/work/projects/-slug/u/subagents/agent-1.jsonl" \
+        "$SB/home/.claude-profiles/work")
+    assert_contains "nested subagent transcript still names the profile" "work" "$out"
+    assert_not_contains "nested transcript does not false-alarm" "MISMATCH" "$out"
+    out=$(sl "$SB/home/.claude/projects/-slug/u/subagents/agent-1.jsonl" "")
+    assert_contains "nested transcript in default profile reads as default" "default" "$out"
+
     # The tripwire: launcher says one profile, Claude Code is writing to another.
     out=$(sl "$SB/home/.claude/projects/-slug/x.jsonl" "$SB/home/.claude-profiles/work")
     assert_contains "mismatch is loud" "PROFILE MISMATCH" "$out"
