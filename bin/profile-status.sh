@@ -35,16 +35,23 @@ _cp_in=$(cat 2>/dev/null)
 
 # --- locate the session's real config dir ------------------------------------
 
-# transcript_path is <config-dir>/projects/<slug>/<uuid>.jsonl
+# transcript_path is <config-dir>/projects/<slug>/<uuid>.jsonl — but not
+# always: subagent transcripts nest deeper, as
+# <config-dir>/projects/<slug>/<uuid>/subagents/agent-<id>.jsonl. So strip
+# from the /projects/ segment rather than counting directories back up, which
+# would silently resolve to the wrong directory at any other depth and could
+# fire a false PROFILE MISMATCH. A tripwire that cries wolf is worse than none.
+#
+# `%` not `%%`: remove the SHORTEST matching suffix, i.e. split on the LAST
+# /projects/, so a config dir that itself lives under a "projects" directory
+# still resolves correctly.
 _cp_tp=$(printf '%s' "$_cp_in" |
     sed -n 's/.*"transcript_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
     head -n 1)
 
 _cp_actual=""
 case "$_cp_tp" in
-    */projects/*/*)
-        _cp_actual=$(dirname "$(dirname "$(dirname "$_cp_tp")")")
-        ;;
+    */projects/*) _cp_actual="${_cp_tp%/projects/*}" ;;
 esac
 
 # Fall back to the env var only when the transcript path is unusable (e.g. the
