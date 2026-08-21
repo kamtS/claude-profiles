@@ -289,6 +289,49 @@ $1" 2>&1
     out=$(run "claude-profile new bin </dev/null; echo exit=\$?")
     assert_contains "cannot create a profile named bin" "exit=1" "$out"
 
+    printf '\n-- spend --\n'
+    if command -v python3 >/dev/null 2>&1; then
+        # Planted transcripts with hand-computable costs, mid-month timestamps
+        # so local-timezone month bucketing cannot straddle a boundary.
+        #
+        # Default profile, claude-opus-5 at $5/$25 per MTok:
+        #   1M in + 1M out = $30.00 — plus an exact duplicate (same message id
+        #   and requestId, as a resumed session leaves behind) that must be
+        #   deduped, and a 2025-11 entry that must fall outside the month.
+        mkdir -p "$SB/home/.claude/projects/-spend"
+        cat > "$SB/home/.claude/projects/-spend/s1.jsonl" <<'JSONL'
+{"type":"assistant","timestamp":"2026-01-15T10:00:00.000Z","requestId":"req_1","message":{"id":"msg_1","model":"claude-opus-5","usage":{"input_tokens":1000000,"output_tokens":1000000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+{"type":"assistant","timestamp":"2026-01-15T10:00:00.000Z","requestId":"req_1","message":{"id":"msg_1","model":"claude-opus-5","usage":{"input_tokens":1000000,"output_tokens":1000000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+{"type":"assistant","timestamp":"2025-11-15T10:00:00.000Z","requestId":"req_0","message":{"id":"msg_0","model":"claude-opus-5","usage":{"input_tokens":9000000,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+{"type":"user","timestamp":"2026-01-15T10:00:01.000Z","message":{"role":"user","content":"noise line without usage"}}
+JSONL
+        # Work profile, claude-sonnet-5 at $3/$15 per MTok:
+        #   1M out ($15) + 1M 5m-cache write at 1.25x ($3.75)
+        #   + 1M 1h-cache write at 2x ($6) + 10M cache reads at 0.1x ($3)
+        #   = $27.75. Grand total across profiles: $57.75.
+        mkdir -p "$SB/home/.claude-profiles/work/projects/-spend"
+        cat > "$SB/home/.claude-profiles/work/projects/-spend/s2.jsonl" <<'JSONL'
+{"type":"assistant","timestamp":"2026-01-20T10:00:00.000Z","requestId":"req_2","message":{"id":"msg_2","model":"claude-sonnet-5","usage":{"input_tokens":0,"output_tokens":1000000,"cache_read_input_tokens":10000000,"cache_creation":{"ephemeral_5m_input_tokens":1000000,"ephemeral_1h_input_tokens":1000000}}}}
+JSONL
+        out=$(run "claude-profile spend 2026-01")
+        assert_contains "spend prices the default profile" '$30.00' "$out"
+        assert_contains "spend prices the work profile" '$27.75' "$out"
+        assert_contains "spend totals across profiles" '$57.75' "$out"
+        assert_not_contains "spend excludes other months" "9.0M" "$out"
+        assert_contains "spend says it is a list-price figure" "list rates" "$out"
+
+        out=$(run "claude-profile spend 2026-01 --models")
+        assert_contains "spend --models names the model" "claude-sonnet-5" "$out"
+
+        out=$(run "claude-profile spend 2026-01 --json")
+        assert_contains "spend --json reports the total" '"total_usd": 57.75' "$out"
+
+        out=$(run "claude-profile spend nonsense; echo exit=\$?")
+        assert_contains "spend rejects a malformed month" "exit=1" "$out"
+    else
+        printf '  SKIP  python3 not installed\n'
+    fi
+
     printf '\n-- usage --\n'
     out=$(run "claude-profile bogus; echo exit=\$?")
     assert_contains "unknown command exits non-zero" "exit=1" "$out"
