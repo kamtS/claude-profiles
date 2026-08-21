@@ -95,6 +95,24 @@ The renderer takes the name from the session's `transcript_path` — where Claud
 
 One `statusLine` entry in the shared `~/.claude/settings.json` covers every profile, because Claude Code runs the command per session with that session's own config dir.
 
+### What did each profile cost this month?
+
+Every session transcript already records the model and exact token counts per message, so the answer needs no tracking, no daemon and no extra state — the transcripts are the ledger:
+
+```console
+$ claude-profile spend
+Spend for 2026-08, priced at Claude API list rates
+
+PROFILE                MSGS     INPUT    OUTPUT  CACHE WR  CACHE RD       SPEND
+(default)              4306      8.6K      2.2M     20.5M    645.4M     $536.31
+-work                  2554      6.2K      1.7M     11.5M    422.5M     $377.20
+TOTAL                                                                   $913.51
+```
+
+Pass a month to look back (`claude-profile spend 2026-07`), `--models` to break each profile down by model, or `--json` for scripts and dashboards. Messages duplicated by resumed sessions are counted once, and cache writes and reads are priced at their own rates.
+
+Two honest caveats. Subscription plans aren't billed per token, so the figure is the **pay-as-you-go list-price equivalent** — what the same usage would have cost on the API. That's still the number you want for comparing profiles, months, or "was this month heavier than last?". And it's computed from the transcripts on this machine: sessions run elsewhere (claude.ai, another laptop) aren't in it. Requires `python3`.
+
 ### Scripts, cron and CI
 
 `claude -work` is a **shell function**. Non-interactive shells never source your `~/.zshrc`, so in a script that prefix doesn't exist — and plain `claude` there silently uses the default profile, with no status line to give it away. Use `exec`:
