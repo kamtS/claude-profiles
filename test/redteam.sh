@@ -282,6 +282,45 @@ $1" 2>&1
     out=$(run "ls \"\$CLAUDE_PROFILES_DIR/work\" | grep -c unshared")
     assert_contains "repair did not pile up backups" "1" "$out"
 
+    printf '\n-- doctor spots stale post-upgrade Claude sessions --\n'
+    cat > "$SB/bin/id" <<'STUB'
+#!/usr/bin/env bash
+printf '501\n'
+STUB
+    cat > "$SB/bin/pgrep" <<'STUB'
+#!/usr/bin/env bash
+[ "$*" = "-u 501 -x claude" ] || exit 0
+printf '4242\n4343\n'
+STUB
+    cat > "$SB/bin/lsof" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+    *'-p 4242'*)
+        printf 'p4242\nftxt\nn/removed path/claude-code/2.1.228.upgrading/claude\n'
+        ;;
+    *'-p 4343'*)
+        printf 'p4343\nftxt\nn%s\n' "$CLAUDE_TEST_EXE"
+        ;;
+esac
+STUB
+    chmod +x "$SB/bin/id" "$SB/bin/pgrep" "$SB/bin/lsof"
+    out=$(CLAUDE_TEST_EXE="$SB/bin/claude" run "claude-profile doctor; echo exit=\$?")
+    assert_contains "doctor reports the stale process" "pid 4242" "$out"
+    assert_contains "doctor explains the removed executable" \
+        "/removed path/claude-code/2.1.228.upgrading/claude" "$out"
+    assert_contains "doctor counts only removed executables" "WARN 1 session" "$out"
+    assert_not_contains "doctor ignores a healthy executable" "pid 4343" "$out"
+    assert_contains "doctor recommends a graceful exit" "exit those sessions normally" "$out"
+    assert_contains "stale process makes doctor non-zero" "exit=1" "$out"
+    rm -f "$SB/bin/id" "$SB/bin/pgrep" "$SB/bin/lsof"
+
+    # With a deliberately minimal PATH, none of the optional process tools are
+    # visible. The helper must distinguish that from a clean scan.
+    local helper_out
+    helper_out=$(HOME="$SB/home" PATH="$SB/bin" CLAUDE_PROFILES_DIR="$SB/home/.claude-profiles" \
+        "$sh_abs" -c ". '$SRC'; _claude_profile_stale_processes; echo rc=\$?" 2>&1)
+    assert_contains "missing process tools return the SKIP state" "rc=2" "$helper_out"
+
     printf '\n-- bin/ is not a profile --\n'
     mkdir -p "$SB/home/.claude-profiles/bin"
     out=$(run "claude-profile ls")

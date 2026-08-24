@@ -90,6 +90,35 @@ _claude_profile_bin() {
     fi
 }
 
+# Emit PID|executable for running Claude processes whose executable has been
+# removed from disk. Package-manager upgrades can leave old interactive
+# sessions alive from an `.upgrading` path after installing a new binary. That
+# stale cross-version state has been observed alongside otherwise context-free
+# EPERM launch failures and is an actionable diagnostic lead. Return 2 when the
+# optional process-inspection tools are unavailable so doctor can say SKIP
+# rather than claim the machine is clean.
+_claude_profile_stale_processes() {
+    command -v id >/dev/null 2>&1 || return 2
+    command -v pgrep >/dev/null 2>&1 || return 2
+    command -v lsof >/dev/null 2>&1 || return 2
+
+    _cp_uid=$(id -u 2>/dev/null) || return 2
+    case "$_cp_uid" in
+        "" | *[!0-9]*) return 2 ;;
+    esac
+
+    pgrep -u "$_cp_uid" -x claude 2>/dev/null | while IFS= read -r _cp_pid; do
+        case "$_cp_pid" in
+            "" | *[!0-9]*) continue ;;
+        esac
+        _cp_exe=$(lsof -a -p "$_cp_pid" -d txt -Fn 2>/dev/null |
+            sed -n 's/^n//p' | head -n 1)
+        [ -n "$_cp_exe" ] || continue
+        [ -e "$_cp_exe" ] || printf '%s|%s\n' "$_cp_pid" "$_cp_exe"
+    done
+    unset _cp_uid _cp_pid _cp_exe
+}
+
 # Resolve a profile name to its directory, or fail. Never interpolates an
 # unvalidated name into a path.
 _claude_profile_dir() {
@@ -762,6 +791,25 @@ PYEOF
                     ;;
             esac
 
+            printf '\nRunning Claude processes:\n'
+            _cp_stale=$(_claude_profile_stale_processes)
+            _cp_stale_rc=$?
+            if [ "$_cp_stale_rc" -eq 2 ]; then
+                printf '  SKIP — process inspection needs id, pgrep and lsof\n'
+            elif [ -n "$_cp_stale" ]; then
+                _cp_stale_count=$(printf '%s\n' "$_cp_stale" | wc -l | tr -d ' ')
+                printf '  WARN %s session(s) are running from executables no longer on disk:\n' \
+                    "$_cp_stale_count"
+                printf '%s\n' "$_cp_stale" | while IFS='|' read -r _cp_pid _cp_exe; do
+                    printf '    pid %s: %s\n' "$_cp_pid" "$_cp_exe"
+                done
+                printf '       This can leave stale runtime state after an upgrade. Save work,\n'
+                printf '       exit those sessions normally, then retry the profile launch.\n'
+                _cp_rc=1
+            else
+                printf '  ok — no sessions running from removed executables\n'
+            fi
+
             printf '\nCLAUDE_CONFIG_DIR still honoured:\n'
             # `claude --version` never touches the config dir, so asking it to
             # run against a throwaway dir proves nothing. Start a real session
@@ -844,7 +892,8 @@ PYEOF
             else
                 printf 'Problems found — see FAIL/WARN above.\n'
             fi
-            unset _cp_probe _cp_kind _cp_d _cp_n _cp_item
+            unset _cp_probe _cp_kind _cp_d _cp_n _cp_item _cp_stale
+            unset _cp_stale_rc _cp_stale_count _cp_uid _cp_pid _cp_exe
             return $_cp_rc
             ;;
 

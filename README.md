@@ -166,8 +166,12 @@ $ claude-profile doctor
 - `CLAUDE_CONFIG_DIR` is still honoured, checked by running a real session against a throwaway directory and confirming config lands there. (Asking `claude --version` would prove nothing — it never touches the config dir.)
 - The status line is wired up, so sessions still announce themselves.
 - Every profile's shared links are intact — including a file that has stopped being a symlink.
+- No pre-upgrade Claude sessions are still running from an executable that has
+  since been removed. That stale cross-version state has been observed alongside
+  unexplained `EPERM` launch failures; save those sessions' work, exit them
+  normally, and retry. This check is skipped when `pgrep` or `lsof` is absent.
 
-That last one matters: if Claude Code ever writes `settings.json` by writing a temp file and renaming it over the top, the rename **replaces the symlink with a regular file** and the profile silently stops sharing. `doctor` reports it as `UNSHARED`, and `repair` relinks it — moving the diverged copy aside to `settings.json.unshared-<timestamp>` rather than deleting it, because that copy is the only record of whatever changed.
+The shared-link check matters: if Claude Code ever writes `settings.json` by writing a temp file and renaming it over the top, the rename **replaces the symlink with a regular file** and the profile silently stops sharing. `doctor` reports it as `UNSHARED`, and `repair` relinks it — moving the diverged copy aside to `settings.json.unshared-<timestamp>` rather than deleting it, because that copy is the only record of whatever changed.
 
 ### What is *not* shared
 
