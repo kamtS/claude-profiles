@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# claude-profiles — multiple Claude Code workspace logins, one CLI
+# claude-profiles — multiple Claude Code and Codex logins, one CLI
 # https://github.com/kamtS/claude-profiles
 #
 # Requires bash or zsh. The body is otherwise POSIX-flavoured, but the
@@ -13,6 +13,7 @@
 # Usage:
 #     claude                  default profile (~/.claude, untouched)
 #     claude -work [args...]  run against the "work" profile
+#     codex  -work [args...]  same profile, Codex instead of Claude Code
 #     claude-profile new work create a profile and log into it
 #     claude-profile ls       list profiles and their accounts
 #     claude-profile rm work  delete a profile
@@ -21,6 +22,12 @@
 # config, credentials, MCP servers and history live. This wrapper swaps
 # that directory based on a leading -<name> argument. On macOS the OS
 # keychain namespaces credentials per config dir, so logins never collide.
+#
+# Codex works the same way through CODEX_HOME, and is in one respect easier:
+# it keeps its credentials in $CODEX_HOME/auth.json on disk rather than in the
+# keychain, so a separate home is a separate login with nothing shared. Both
+# wrappers refuse to fall back to the default profile when a -<name> argument
+# names no profile, because a silent fallback bills the wrong account.
 #
 # Licensed under the MIT License.
 
@@ -36,6 +43,25 @@ CLAUDE_PROFILES_DIR="${CLAUDE_PROFILES_DIR:-$HOME/.claude-profiles}"
 # definitions — the usual place inline API keys and OAuth tokens end up — live
 # in .claude.json INSIDE each config dir and are never shared by this list.
 CLAUDE_PROFILE_SHARED="settings.json skills agents commands plugins CLAUDE.md"
+
+# Codex homes live in a hidden sibling directory of the Claude profile dirs,
+# so one profile name means the same client in both runtimes and a single
+# directory still holds everything worth backing up. The leading dot is what
+# keeps it out of profile enumeration: _claude_profile_valid_name rejects any
+# name that does not start with an alphanumeric, so ".codex" can never be
+# mistaken for a profile of its own.
+CODEX_PROFILES_SUBDIR=".codex"
+
+# Config shared (by symlink) into each new Codex home. As with the Claude
+# list, nothing here may carry secrets, and `claude-profile audit` enforces it.
+#
+# Two deliberate omissions. config.toml is absent because it is Codex's
+# equivalent of a credential store-adjacent file: it holds `env_key`, MCP
+# server definitions and other settings that hand a session credentials.
+# `memories` is absent because it is accumulated per-client context rather
+# than configuration — sharing it would leak one client's working notes into
+# another client's session, which is the whole thing profiles exist to stop.
+CODEX_PROFILE_SHARED="AGENTS.md skills prompts rules plugins"
 
 # Where the statusLine renderer lives, relative to this script.
 CLAUDE_PROFILE_STATUS_BIN="${CLAUDE_PROFILE_STATUS_BIN:-$CLAUDE_PROFILES_DIR/bin/profile-status.sh}"
@@ -173,28 +199,99 @@ try {
 # nothing. The static list is today's short flags; the `--help` scrape is the
 # part that survives a future release adding a new one, which is exactly the
 # kind of quiet drift that would otherwise turn a real flag into a hard error.
-_claude_profile_is_real_flag() {
+# True when $2 is a genuine single-dash flag of the runtime named by $1, and
+# so must be passed through rather than treated as a profile name. The known
+# short flags are listed explicitly per runtime so the check still gives the
+# right answer when the binary is missing or `--help` cannot be run; anything
+# else is confirmed against that runtime's own help text.
+_ap_is_real_flag() {
     case "$1" in
-        -c | -d | -h | -n | -p | -r | -v | -w) return 0 ;;
+        claude)
+            case "$2" in
+                -c | -d | -h | -n | -p | -r | -v | -w) return 0 ;;
+            esac
+            ;;
+        codex)
+            # Codex 0.154's single-dash flags. Note -p: Codex uses it for its
+            # own config profiles (layering $CODEX_HOME/<name>.config.toml),
+            # which are a different concept from these account profiles. It
+            # passes through to Codex untouched.
+            case "$2" in
+                -a | -c | -C | -h | -i | -m | -p | -s | -V) return 0 ;;
+            esac
+            ;;
     esac
-    command -v claude >/dev/null 2>&1 || return 1
-    command claude --help 2>/dev/null |
-        grep -qE "(^|[[:space:],])$(printf '%s' "$1" | sed 's/[^A-Za-z0-9-]/./g')([[:space:],]|$)"
+    command -v "$1" >/dev/null 2>&1 || return 1
+    command "$1" --help 2>/dev/null |
+        grep -qE "(^|[[:space:],])$(printf '%s' "$2" | sed 's/[^A-Za-z0-9-]/./g')([[:space:],]|$)"
 }
 
-# Emit the shared-config entries, one per line.
+# Kept for compatibility with anything that called the original name.
+_claude_profile_is_real_flag() {
+    _ap_is_real_flag claude "$1"
+}
+
+# Decide whether a leading -<name> argument claims a profile, for either
+# runtime. Prints the profile directory on stdout when it does.
+#
+#   0  claimed  — caller should shift and use the printed directory
+#   1  not profile-shaped, or a genuine flag — pass it through untouched
+#   2  profile-shaped but no such profile — refuse, message already on stderr
+#
+# Both wrappers share this so the refusal logic cannot drift between them:
+# an unmatched profile-shaped argument must never silently fall back to the
+# default profile, in either runtime.
+_ap_claim_profile() {
+    _ap_rt="$1"
+    _ap_root="$2"
+    _ap_arg="${3:-}"
+
+    case "$_ap_arg" in
+        --* | "") unset _ap_rt _ap_root _ap_arg; return 1 ;;
+        -?*) ;;
+        *) unset _ap_rt _ap_root _ap_arg; return 1 ;;
+    esac
+
+    _ap_name="${_ap_arg#-}"
+    if ! _claude_profile_valid_name "$_ap_name"; then
+        unset _ap_rt _ap_root _ap_arg _ap_name
+        return 1
+    fi
+
+    if ! _claude_profile_is_reserved_dir "$_ap_name" && [ -d "$_ap_root/$_ap_name" ]; then
+        printf '%s\n' "$_ap_root/$_ap_name"
+        unset _ap_rt _ap_root _ap_arg _ap_name
+        return 0
+    fi
+
+    if _ap_is_real_flag "$_ap_rt" "$_ap_arg"; then
+        unset _ap_rt _ap_root _ap_arg _ap_name
+        return 1
+    fi
+
+    printf 'claude-profile: no %s profile "%s" in %s\n' \
+        "$_ap_rt" "$_ap_name" "$_ap_root" >&2
+    printf 'Refusing to fall back to the default profile.\n' >&2
+    printf 'Run "claude-profile ls" to see what exists.\n' >&2
+    unset _ap_rt _ap_root _ap_arg _ap_name
+    return 2
+}
+
+# Emit the shared-config entries, one per line. $1 is the space-separated
+# list, defaulting to the Claude one so existing callers are unchanged.
 # Iterate via `tr` + `read`, NOT `for x in $CLAUDE_PROFILE_SHARED`: zsh does not
 # word-split unquoted scalars, so a plain `for` loop silently iterated nothing.
 _claude_profile_shared_items() {
-    printf '%s\n' "$CLAUDE_PROFILE_SHARED" | tr ' ' '\n' | while IFS= read -r _cp_i; do
+    printf '%s\n' "${1:-$CLAUDE_PROFILE_SHARED}" | tr ' ' '\n' | while IFS= read -r _cp_i; do
         [ -n "$_cp_i" ] && printf '%s\n' "$_cp_i"
     done
 }
 
-# Link one shared entry into a profile. Reports what it did on stdout so the
-# caller can summarise. Never clobbers an existing entry.
+# Link one shared entry into a profile. $3 is the directory the canonical copy
+# lives in, defaulting to ~/.claude so existing callers are unchanged. Reports
+# what it did on stdout so the caller can summarise. Never clobbers an entry.
 _claude_profile_link_item() {
-    _cp_t="$HOME/.claude/$2"
+    _cp_t="${3:-$HOME/.claude}/$2"
     _cp_l="$1/$2"
     [ -e "$_cp_t" ] || return 0
     if [ -L "$_cp_l" ]; then
@@ -212,6 +309,94 @@ _claude_profile_link_item() {
         ln -s "$_cp_t" "$_cp_l" 2>/dev/null && printf 'linked %s\n' "$2"
     fi
     unset _cp_t _cp_l _cp_bak
+}
+
+# --- codex -------------------------------------------------------------------
+
+# The directory holding every Codex home, one per profile.
+_codex_profile_root() {
+    printf '%s\n' "$CLAUDE_PROFILES_DIR/$CODEX_PROFILES_SUBDIR"
+}
+
+# Resolve a profile name to its Codex home, or fail. Never interpolates an
+# unvalidated name into a path.
+_codex_profile_home() {
+    _claude_profile_valid_name "$1" || return 1
+    printf '%s\n' "$(_codex_profile_root)/$1"
+}
+
+# True when $1 has a Codex home. A profile can legitimately exist for one
+# runtime and not the other, so this is asked separately from the Claude one.
+_codex_profile_exists() {
+    _claude_profile_valid_name "$1" || return 1
+    _claude_profile_is_reserved_dir "$1" && return 1
+    [ -d "$(_codex_profile_root)/$1" ]
+}
+
+# Path to the real codex binary, skipping our own shell function.
+_codex_profile_bin() {
+    if [ -n "$ZSH_VERSION" ]; then
+        whence -p codex 2>/dev/null
+    else
+        type -P codex 2>/dev/null
+    fi
+}
+
+# Print the account recorded in a Codex home, or a fallback.
+#
+# Codex stores credentials in $CODEX_HOME/auth.json. The signed-in address is
+# the `email` claim of the OIDC id_token in there, so this decodes the JWT
+# payload - the middle, unsigned, base64url segment - and reads that one claim.
+# It deliberately never prints, logs or returns any part of the tokens
+# themselves; `ls` output should be safe to paste into a ticket.
+_codex_profile_account() {
+    _cp_auth="$1/auth.json"
+    if [ ! -f "$_cp_auth" ]; then
+        printf 'not logged in\n'
+        unset _cp_auth
+        return 0
+    fi
+
+    _cp_who=""
+    if command -v python3 >/dev/null 2>&1; then
+        _cp_who=$(python3 - "$_cp_auth" <<'CODEXAUTHEOF' 2>/dev/null
+import base64, json, sys
+try:
+    with open(sys.argv[1]) as fh:
+        data = json.load(fh)
+except Exception:
+    sys.exit(0)
+if not isinstance(data, dict):
+    sys.exit(0)
+tok = data.get("tokens")
+raw = tok.get("id_token") if isinstance(tok, dict) else None
+if isinstance(raw, str) and raw.count(".") == 2:
+    seg = raw.split(".")[1]
+    seg += "=" * (-len(seg) % 4)
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(seg))
+    except Exception:
+        claims = {}
+    # The email claim only. Nothing else from the token is read or printed.
+    email = claims.get("email") if isinstance(claims, dict) else None
+    if isinstance(email, str) and email:
+        print(email)
+        sys.exit(0)
+if data.get("OPENAI_API_KEY"):
+    print("API key")
+    sys.exit(0)
+mode = data.get("auth_mode")
+print(mode if isinstance(mode, str) and mode else "logged in")
+CODEXAUTHEOF
+        )
+    fi
+    if [ -z "$_cp_who" ]; then
+        # No python3, or an auth.json this version does not understand. Say
+        # something true rather than guessing at an account.
+        _cp_who="logged in (details need python3)"
+    fi
+    printf '%s\n' "$_cp_who"
+    unset _cp_auth _cp_who
 }
 
 # Scan a path for credential-shaped content. Prints "path: KEY" lines — key
@@ -260,79 +445,98 @@ PYEOF
 
 # --- the wrapper -------------------------------------------------------------
 
+# Claim a leading single-dash argument when it names an existing profile.
+# When it does not, the old behaviour was to pass it through to Claude Code
+# unchanged — which meant `claude -clienta` after a rename, a moved
+# CLAUDE_PROFILES_DIR, or a plain typo ran the DEFAULT profile without a
+# word. For anyone billing clients per profile that is the worst possible
+# failure: silent, and wrong in the expensive direction. So an unmatched
+# profile-shaped argument is a hard error, and only arguments that are
+# genuinely flags of that runtime pass through. Both wrappers share
+# _ap_claim_profile so that rule cannot drift between them.
 claude() {
-    _cp_dir=""
-
-    # Claim a leading single-dash argument when it names an existing profile.
-    # When it does not, the old behaviour was to pass it through to Claude Code
-    # unchanged — which meant `claude -clienta` after a rename, a moved
-    # CLAUDE_PROFILES_DIR, or a plain typo ran the DEFAULT profile without a
-    # word. For anyone billing clients per profile that is the worst possible
-    # failure: silent, and wrong in the expensive direction. So an unmatched
-    # profile-shaped argument is now a hard error, and only arguments that are
-    # genuinely Claude Code flags pass through.
-    case "$1" in
-        --* | "") ;;
-        -?*)
-            _cp_name="${1#-}"
-            if _claude_profile_valid_name "$_cp_name"; then
-                if _claude_profile_exists "$_cp_name"; then
-                    _cp_dir="$CLAUDE_PROFILES_DIR/$_cp_name"
-                    shift
-                elif ! _claude_profile_is_real_flag "$1"; then
-                    printf 'claude-profile: no profile "%s" in %s\n' \
-                        "$_cp_name" "$CLAUDE_PROFILES_DIR" >&2
-                    printf 'Refusing to fall back to the default profile.\n' >&2
-                    printf 'Run "claude-profile ls" to see what exists.\n' >&2
-                    unset _cp_name _cp_dir
-                    return 2
-                fi
-            fi
-            unset _cp_name
-            ;;
-    esac
-
-    if [ -n "$_cp_dir" ]; then
+    _cp_dir=$(_ap_claim_profile claude "$CLAUDE_PROFILES_DIR" "${1:-}")
+    _cp_rc=$?
+    if [ "$_cp_rc" -eq 2 ]; then
+        unset _cp_dir _cp_rc
+        return 2
+    fi
+    if [ "$_cp_rc" -eq 0 ]; then
+        shift
         # CLAUDE_PROFILE is exported for anything downstream that wants to show
         # the profile too — a shell prompt, tmux, a hook.
         [ -n "${CLAUDE_PROFILE_QUIET:-}" ] ||
             printf 'claude-profiles: %s → %s\n' "$(basename "$_cp_dir")" "$_cp_dir" >&2
         CLAUDE_CONFIG_DIR="$_cp_dir" CLAUDE_PROFILE="$(basename "$_cp_dir")" \
             command claude "$@"
-    else
+        _cp_rc=$?
         unset _cp_dir
-        command claude "$@"
+        return $_cp_rc
     fi
+    unset _cp_dir _cp_rc
+    command claude "$@"
+}
+
+# The same wrapper for Codex, over CODEX_HOME instead of CLAUDE_CONFIG_DIR.
+#
+# Codex has no status line, so the launch banner on stderr is the only thing
+# telling you which account a session is about to bill. That makes it more
+# important here than it is for Claude Code, not less — CLAUDE_PROFILE_QUIET
+# silences it, but think twice before setting that.
+codex() {
+    _cp_dir=$(_ap_claim_profile codex "$(_codex_profile_root)" "${1:-}")
+    _cp_rc=$?
+    if [ "$_cp_rc" -eq 2 ]; then
+        unset _cp_dir _cp_rc
+        return 2
+    fi
+    if [ "$_cp_rc" -eq 0 ]; then
+        shift
+        [ -n "${CLAUDE_PROFILE_QUIET:-}" ] ||
+            printf 'claude-profiles: codex %s → %s\n' "$(basename "$_cp_dir")" "$_cp_dir" >&2
+        CODEX_HOME="$_cp_dir" CLAUDE_PROFILE="$(basename "$_cp_dir")" \
+            command codex "$@"
+        _cp_rc=$?
+        unset _cp_dir
+        return $_cp_rc
+    fi
+    unset _cp_dir _cp_rc
+    command codex "$@"
 }
 
 # --- the manager -------------------------------------------------------------
 
 claude_profile_usage() {
     cat <<'EOF'
-claude-profile — manage Claude Code workspace profiles
+claude-profile — manage Claude Code and Codex workspace profiles
 
   claude-profile new <name>    create a profile, then log into it
-  claude-profile ls            list profiles and the account each holds
-  claude-profile rm <name>     delete a profile
-  claude-profile path <name>   print a profile's config directory
+  claude-profile ls            list profiles and the accounts each holds
+  claude-profile rm <name>     delete a profile, both runtimes
+  claude-profile path <name> [claude|codex]
+                               print a profile's config directory
   claude-profile exec <name> [--] <cmd...>
                                run a command against a profile, for scripts
   claude-profile audit [name]  check shared config for credentials
   claude-profile spend [YYYY-MM] [--models] [--json]
-                               the month's usage per profile, priced at
-                               Claude API list rates
+                               the month's usage per profile: Claude priced
+                               at API list rates, Codex in tokens
   claude-profile doctor        check the install still works after an update
   claude-profile repair [name|--all]
                                restore shared links and the status line
 
-Once created, run Claude Code against a profile by prefixing its name:
+Once created, run either runtime against a profile by prefixing its name:
 
   claude -<name> [args...]
+  codex  -<name> [args...]
+
+One name means the same client in both. A profile may exist for only one
+runtime; the other simply shows as "(none)" in `ls`.
 
 That prefix works only in an interactive shell, because it is a shell
 function. In scripts, cron jobs and CI — where ~/.zshrc is never sourced —
 use `claude-profile exec <name> -- claude -p '...'` instead. Calling
-`claude` directly there silently uses the DEFAULT profile.
+`claude` or `codex` directly there silently uses the DEFAULT profile.
 
 Names must start with a letter or digit and contain only letters, digits,
 dot, underscore or hyphen.
@@ -394,6 +598,30 @@ claude-profile() {
                 printf '  shared from ~/.claude: nothing found to share\n'
             fi
 
+            # Codex home for the same profile name. Created up front, before
+            # either login, so the directory exists however the logins go.
+            _cp_codex=""
+            if command -v codex >/dev/null 2>&1; then
+                _cp_codex="$(_codex_profile_root)/$_cp_name"
+                if mkdir -p "$_cp_codex" 2>/dev/null; then
+                    chmod 700 "$_cp_codex" 2>/dev/null
+                    _cp_linked=$(_claude_profile_shared_items "$CODEX_PROFILE_SHARED" |
+                        while IFS= read -r _cp_item; do
+                            _claude_profile_link_item "$_cp_codex" "$_cp_item" "$HOME/.codex"
+                        done)
+                    printf '  codex home: %s\n' "$_cp_codex"
+                    if [ -n "$_cp_linked" ]; then
+                        printf '  shared from ~/.codex:\n'
+                        printf '%s\n' "$_cp_linked" | sed 's/^/    /'
+                    else
+                        printf '  shared from ~/.codex: nothing found to share\n'
+                    fi
+                else
+                    printf '  codex home: could not create %s\n' "$_cp_codex"
+                    _cp_codex=""
+                fi
+            fi
+
             # Make sure the session will say which profile it is billing.
             if ! grep -q '"statusLine"' "$HOME/.claude/settings.json" 2>/dev/null; then
                 printf '\nNote: no statusLine configured, so sessions will not display\n'
@@ -403,25 +631,64 @@ claude-profile() {
             printf 'If it does not prompt automatically, run /login.\n\n'
             CLAUDE_CONFIG_DIR="$_cp_dir" command claude
             printf '\nDone. Use this profile any time with: claude -%s\n' "$_cp_name"
-            unset _cp_name _cp_dir _cp_item
+
+            if [ -n "$_cp_codex" ]; then
+                # Codex logins are separate: separate home, separate auth.json,
+                # separate account. Offered rather than forced, because plenty
+                # of profiles will only ever be used from one runtime.
+                printf 'Log into Codex for this profile too? [y/N] '
+                read -r _cp_reply
+                case "$_cp_reply" in
+                    [Yy]*)
+                        CODEX_HOME="$_cp_codex" CLAUDE_PROFILE="$_cp_name" \
+                            command codex login
+                        printf '\nAnd with: codex -%s\n' "$_cp_name"
+                        ;;
+                    *)
+                        printf 'Skipped. Log in later with: codex -%s login\n' "$_cp_name"
+                        ;;
+                esac
+            fi
+            unset _cp_name _cp_dir _cp_item _cp_codex _cp_reply
             ;;
 
         ls | list)
-            printf '%-16s %s\n' "PROFILE" "ACCOUNT"
+            printf '%-16s %-34s %s\n' "PROFILE" "CLAUDE" "CODEX"
             # The default profile keeps its config JSON at ~/.claude.json,
-            # not inside ~/.claude/.
-            printf '%-16s %s\n' "(default)" "$(_claude_profile_account "$HOME/.claude.json")"
+            # not inside ~/.claude/. Codex's default home is ~/.codex.
+            printf '%-16s %-34s %s\n' "(default)" \
+                "$(_claude_profile_account "$HOME/.claude.json")" \
+                "$(_codex_profile_account "$HOME/.codex")"
 
-            if [ -d "$CLAUDE_PROFILES_DIR" ]; then
-                # find, not a glob: portable across bash and zsh, and safe
-                # when the directory is empty.
-                find "$CLAUDE_PROFILES_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null |
-                    sort | while IFS= read -r _cp_d; do
-                    _cp_n=$(basename "$_cp_d")
-                    _claude_profile_exists "$_cp_n" || continue
-                    printf '%-16s %s\n' "-$_cp_n" "$(_claude_profile_account "$_cp_d/.claude.json")"
-                done
-            fi
+            # A profile can exist for one runtime and not the other, so the
+            # two directory trees are unioned rather than one driving the list.
+            {
+                if [ -d "$CLAUDE_PROFILES_DIR" ]; then
+                    # find, not a glob: portable across bash and zsh, and safe
+                    # when the directory is empty.
+                    find "$CLAUDE_PROFILES_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null
+                fi
+                if [ -d "$(_codex_profile_root)" ]; then
+                    find "$(_codex_profile_root)" -mindepth 1 -maxdepth 1 -type d 2>/dev/null
+                fi
+            } | while IFS= read -r _cp_d; do
+                basename "$_cp_d"
+            done | sort -u | while IFS= read -r _cp_n; do
+                _claude_profile_valid_name "$_cp_n" || continue
+                _claude_profile_is_reserved_dir "$_cp_n" && continue
+                if _claude_profile_exists "$_cp_n"; then
+                    _cp_a=$(_claude_profile_account "$CLAUDE_PROFILES_DIR/$_cp_n/.claude.json")
+                else
+                    _cp_a="(none)"
+                fi
+                if _codex_profile_exists "$_cp_n"; then
+                    _cp_b=$(_codex_profile_account "$(_codex_profile_root)/$_cp_n")
+                else
+                    _cp_b="(none)"
+                fi
+                printf '%-16s %-34s %s\n' "-$_cp_n" "$_cp_a" "$_cp_b"
+            done
+            unset _cp_d _cp_n _cp_a _cp_b
             ;;
 
         rm | remove | delete)
@@ -432,39 +699,52 @@ claude-profile() {
             fi
             _cp_dir="$CLAUDE_PROFILES_DIR/$_cp_name"
 
-            # Belt and braces: the name is already validated, but confirm the
+            _cp_codex="$(_codex_profile_root)/$_cp_name"
+
+            # Belt and braces: the name is already validated, but confirm each
             # target really is a direct child of the profiles directory and
             # not a symlink pointing somewhere else before removing anything.
-            if [ -L "$_cp_dir" ]; then
-                printf 'claude-profile: "%s" is a symlink; refusing to delete.\n' "$_cp_name" >&2
-                return 1
-            fi
-            if [ ! -d "$_cp_dir" ]; then
+            for _cp_t in "$_cp_dir" "$_cp_codex"; do
+                if [ -L "$_cp_t" ]; then
+                    printf 'claude-profile: "%s" is a symlink; refusing to delete.\n' "$_cp_t" >&2
+                    unset _cp_t
+                    return 1
+                fi
+                case "$_cp_t" in
+                    "$CLAUDE_PROFILES_DIR"/*) ;;
+                    *)
+                        printf 'claude-profile: refusing to delete outside %s\n' "$CLAUDE_PROFILES_DIR" >&2
+                        unset _cp_t
+                        return 1
+                        ;;
+                esac
+            done
+            unset _cp_t
+
+            # A profile may legitimately exist for only one runtime.
+            if [ ! -d "$_cp_dir" ] && [ ! -d "$_cp_codex" ]; then
                 printf 'claude-profile: no such profile: %s\n' "$_cp_name" >&2
                 return 1
             fi
-            case "$_cp_dir" in
-                "$CLAUDE_PROFILES_DIR"/*) ;;
-                *)
-                    printf 'claude-profile: refusing to delete outside %s\n' "$CLAUDE_PROFILES_DIR" >&2
-                    return 1
-                    ;;
-            esac
 
-            printf 'Delete profile "%s" (%s)?\n' "$_cp_name" "$_cp_dir"
-            printf 'Its login, history and MCP auth will be removed. Type the name to confirm: '
+            printf 'Delete profile "%s"?\n' "$_cp_name"
+            [ -d "$_cp_dir" ] && printf '  claude: %s\n' "$_cp_dir"
+            [ -d "$_cp_codex" ] && printf '  codex:  %s\n' "$_cp_codex"
+            printf 'Its logins, history and MCP auth will be removed. Type the name to confirm: '
             read -r _cp_reply
             if [ "$_cp_reply" != "$_cp_name" ]; then
                 printf 'Aborted.\n'
-                unset _cp_name _cp_dir _cp_reply
+                unset _cp_name _cp_dir _cp_codex _cp_reply
                 return 1
             fi
             # rm -rf removes symlinks themselves, never their targets, so the
-            # shared ~/.claude config is not at risk here.
-            rm -rf "$_cp_dir" && printf 'Deleted "%s".\n' "$_cp_name"
+            # shared ~/.claude and ~/.codex config is not at risk here.
+            [ -d "$_cp_dir" ] && rm -rf "$_cp_dir"
+            [ -d "$_cp_codex" ] && rm -rf "$_cp_codex"
+            printf 'Deleted "%s".\n' "$_cp_name"
             printf 'Note: its keychain credential entry is left in place; remove it\n'
             printf 'manually from Keychain Access if you want it gone.\n'
-            unset _cp_name _cp_dir _cp_reply
+            unset _cp_name _cp_dir _cp_codex _cp_reply
             ;;
 
         exec)
@@ -478,36 +758,51 @@ claude-profile() {
                 printf 'claude-profile: invalid profile name: %s\n' "${_cp_name:-<empty>}" >&2
                 return 1
             fi
-            if ! _claude_profile_exists "$_cp_name"; then
+            if ! _claude_profile_exists "$_cp_name" && ! _codex_profile_exists "$_cp_name"; then
                 printf 'claude-profile: no such profile: %s\n' "$_cp_name" >&2
                 return 2
             fi
             _cp_dir="$CLAUDE_PROFILES_DIR/$_cp_name"
+            _cp_codex="$(_codex_profile_root)/$_cp_name"
             [ "$1" = "--" ] && shift
             if [ $# -eq 0 ]; then
                 set -- claude
             fi
-            CLAUDE_CONFIG_DIR="$_cp_dir" CLAUDE_PROFILE="$_cp_name" command "$@"
+            # Both variables are set regardless of which binary is being run,
+            # and regardless of whether that runtime's directory exists yet.
+            # Pointing CODEX_HOME at an absent home makes Codex start there
+            # unauthenticated, which fails loudly; leaving it unset would send
+            # it to the default account, which is the silent failure this
+            # whole tool exists to prevent.
+            CLAUDE_CONFIG_DIR="$_cp_dir" CODEX_HOME="$_cp_codex" \
+                CLAUDE_PROFILE="$_cp_name" command "$@"
             _cp_rc=$?
-            unset _cp_name _cp_dir
+            unset _cp_name _cp_dir _cp_codex
             return $_cp_rc
             ;;
 
         audit)
             _cp_rc=0
             printf 'Auditing config shared across profiles.\n'
-            printf 'Shared list: %s\n\n' "$CLAUDE_PROFILE_SHARED"
+            printf 'Shared list (claude): %s\n' "$CLAUDE_PROFILE_SHARED"
+            printf 'Shared list (codex):  %s\n\n' "$CODEX_PROFILE_SHARED"
 
-            _cp_found=$(_claude_profile_shared_items | while IFS= read -r _cp_item; do
-                _claude_profile_scan_secrets "$HOME/.claude/$_cp_item"
-            done)
+            _cp_found=$(
+                _claude_profile_shared_items | while IFS= read -r _cp_item; do
+                    _claude_profile_scan_secrets "$HOME/.claude/$_cp_item"
+                done
+                _claude_profile_shared_items "$CODEX_PROFILE_SHARED" |
+                    while IFS= read -r _cp_item; do
+                        _claude_profile_scan_secrets "$HOME/.codex/$_cp_item"
+                    done
+            )
 
             if [ -n "$_cp_found" ]; then
                 printf 'FINDINGS — these are shared into every profile:\n'
                 printf '%s\n' "$_cp_found" | sed 's/^/  /'
                 printf '\nA shared file carrying credentials means one client session\n'
                 printf 'runs with another client credentials loaded. Either remove the\n'
-                printf 'secret, or drop that entry from CLAUDE_PROFILE_SHARED.\n'
+                printf 'secret, or drop that entry from the relevant shared list.\n'
                 _cp_rc=1
             else
                 printf 'No credential-shaped content in shared config.\n'
@@ -517,17 +812,62 @@ claude-profile() {
             # .claude.json inside each config dir, which is never shared — so
             # this is a check that the isolation still holds, not a scan of
             # the shared list.
+            # find, not a glob. Under zsh an unmatched glob is a hard error
+            # (nomatch), so a `for x in dir/*/file` loop aborts the whole audit
+            # on a machine that has no profiles yet — and the Codex tree is
+            # empty exactly like that until the first Codex profile is made.
+            #
+            # The listing is built first and inspected afterwards rather than
+            # setting _cp_rc inside a `while read` loop: that loop is on the
+            # right of a pipe, so it runs in a subshell and any exit code set
+            # there would be silently discarded.
             printf '\nMCP isolation:\n'
-            for _cp_j in "$HOME/.claude.json" "$CLAUDE_PROFILES_DIR"/*/.claude.json; do
-                [ -f "$_cp_j" ] || continue
-                if [ -L "$_cp_j" ]; then
-                    printf '  SHARED (!) %s -> %s\n' "$_cp_j" "$(readlink "$_cp_j")"
-                    _cp_rc=1
-                else
-                    printf '  isolated   %s\n' "$_cp_j"
-                fi
-            done
-            unset _cp_found _cp_j
+            _cp_iso=$(
+                {
+                    [ -f "$HOME/.claude.json" ] && printf '%s\n' "$HOME/.claude.json"
+                    [ -d "$CLAUDE_PROFILES_DIR" ] &&
+                        find "$CLAUDE_PROFILES_DIR" -mindepth 2 -maxdepth 2 \
+                            -name '.claude.json' 2>/dev/null | sort
+                } | while IFS= read -r _cp_j; do
+                    [ -f "$_cp_j" ] || continue
+                    if [ -L "$_cp_j" ]; then
+                        printf '  SHARED (!) %s -> %s\n' "$_cp_j" "$(readlink "$_cp_j")"
+                    else
+                        printf '  isolated   %s\n' "$_cp_j"
+                    fi
+                done
+            )
+            [ -n "$_cp_iso" ] && printf '%s\n' "$_cp_iso"
+            case "$_cp_iso" in *'SHARED (!)'*) _cp_rc=1 ;; esac
+
+            # The same question for Codex. config.toml is where its MCP server
+            # definitions and `env_key` live, and auth.json is the credential
+            # store outright — neither may ever be a link to a shared copy.
+            printf '\nCodex credential and MCP isolation:\n'
+            _cp_iso=$(
+                {
+                    for _cp_j in "$HOME/.codex/config.toml" "$HOME/.codex/auth.json"; do
+                        [ -f "$_cp_j" ] && printf '%s\n' "$_cp_j"
+                    done
+                    [ -d "$(_codex_profile_root)" ] &&
+                        find "$(_codex_profile_root)" -mindepth 2 -maxdepth 2 \
+                            \( -name 'config.toml' -o -name 'auth.json' \) 2>/dev/null | sort
+                } | while IFS= read -r _cp_j; do
+                    [ -f "$_cp_j" ] || continue
+                    if [ -L "$_cp_j" ]; then
+                        printf '  SHARED (!) %s -> %s\n' "$_cp_j" "$(readlink "$_cp_j")"
+                    else
+                        printf '  isolated   %s\n' "$_cp_j"
+                    fi
+                done
+            )
+            if [ -n "$_cp_iso" ]; then
+                printf '%s\n' "$_cp_iso"
+            else
+                printf '  no Codex profiles yet\n'
+            fi
+            case "$_cp_iso" in *'SHARED (!)'*) _cp_rc=1 ;; esac
+            unset _cp_found _cp_iso _cp_j
             return $_cp_rc
             ;;
 
@@ -758,6 +1098,175 @@ if unpriced:
         print("  " + m)
 PYEOF
             _cp_rc=$?
+
+            # Codex usage, reported separately and in tokens only.
+            #
+            # No dollar figure: the models these sessions actually run on have
+            # no list-price table in this script, and inventing one would put a
+            # confidently wrong number next to a correct one. Tokens are the
+            # part that can be stated honestly, so that is what is stated.
+            _cp_pairs=$(printf '(default)\t%s' "$HOME/.codex/sessions")
+            if [ -d "$(_codex_profile_root)" ]; then
+                _cp_more=$(find "$(_codex_profile_root)" -mindepth 1 -maxdepth 1 -type d 2>/dev/null |
+                    sort | while IFS= read -r _cp_d; do
+                    _cp_n=$(basename "$_cp_d")
+                    _codex_profile_exists "$_cp_n" || continue
+                    printf -- '-%s\t%s\n' "$_cp_n" "$_cp_d/sessions"
+                done)
+                [ -n "$_cp_more" ] && _cp_pairs="$_cp_pairs
+$_cp_more"
+                unset _cp_more
+            fi
+            if command -v codex >/dev/null 2>&1; then
+                printf '\n'
+                CODEX_PROFILE_SPEND_DIRS="$_cp_pairs" python3 - "$@" <<'CODEXSPENDEOF'
+import json
+import os
+import sys
+from datetime import datetime
+
+month = None
+as_json = False
+for arg in sys.argv[1:]:
+    if arg == "--json":
+        as_json = True
+    elif arg in ("--models", "-m"):
+        pass
+    elif (len(arg) == 7 and arg[4] == "-"
+          and arg[:4].isdigit() and arg[5:].isdigit() and 1 <= int(arg[5:]) <= 12):
+        month = arg
+if month is None:
+    month = datetime.now().astimezone().strftime("%Y-%m")
+
+pairs = []
+for line in os.environ.get("CODEX_PROFILE_SPEND_DIRS", "").splitlines():
+    if "\t" in line:
+        label, path = line.split("\t", 1)
+        pairs.append((label, path))
+
+# Codex writes a JSONL rollout per session. Its `token_count` events carry
+# `total_token_usage`, a counter that only ever climbs across the session, and
+# `last_token_usage` for the turn. The cumulative counter is the one used here:
+# summing the per-turn figures overcounts by 2-5% because Codex emits more
+# than one event for some turns, and it was never short in any session
+# examined. Taking the cumulative value at the end of the month minus its
+# value before the month starts also attributes a session that straddles a
+# month boundary to the right months, instead of dumping all of it in one.
+def totals_for(root):
+    msgs = 0
+    used = {"input": 0, "output": 0, "cached": 0}
+    models = {}
+    if not os.path.isdir(root):
+        return msgs, used, models
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for fn in filenames:
+            if not fn.endswith(".jsonl"):
+                continue
+            before = None
+            within = None
+            turns = 0
+            model = None
+            last_model_in_month = None
+            try:
+                fh = open(os.path.join(dirpath, fn), errors="ignore")
+            except OSError:
+                continue
+            with fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    payload = rec.get("payload") or {}
+                    if rec.get("type") == "turn_context":
+                        model = payload.get("model") or model
+                    if rec.get("type") != "event_msg":
+                        continue
+                    if payload.get("type") != "token_count":
+                        continue
+                    info = payload.get("info") or {}
+                    tu = info.get("total_token_usage")
+                    if not isinstance(tu, dict):
+                        continue
+                    stamp = rec.get("timestamp") or ""
+                    snapshot = (tu.get("input_tokens", 0),
+                                tu.get("output_tokens", 0),
+                                tu.get("cached_input_tokens", 0))
+                    if stamp[:7] < month:
+                        before = snapshot
+                    elif stamp[:7] == month:
+                        within = snapshot
+                        turns += 1
+                        last_model_in_month = model
+            if within is None:
+                continue
+            base = before or (0, 0, 0)
+            delta = [max(0, w - b) for w, b in zip(within, base)]
+            if not any(delta):
+                continue
+            msgs += turns
+            used["input"] += delta[0]
+            used["output"] += delta[1]
+            used["cached"] += delta[2]
+            key = last_model_in_month or "unknown"
+            agg = models.setdefault(key, {"input": 0, "output": 0, "cached": 0})
+            agg["input"] += delta[0]
+            agg["output"] += delta[1]
+            agg["cached"] += delta[2]
+    return msgs, used, models
+
+rows = []
+for label, path in pairs:
+    msgs, used, models = totals_for(path)
+    rows.append((label, msgs, used, models))
+
+if not any(r[1] or any(r[2].values()) for r in rows):
+    sys.exit(0)
+
+if as_json:
+    print(json.dumps({
+        "month": month,
+        "runtime": "codex",
+        "priced": False,
+        "profiles": [
+            {"profile": label, "turns": msgs,
+             "input_tokens": used["input"], "output_tokens": used["output"],
+             "cached_input_tokens": used["cached"],
+             "models": sorted(models)}
+            for label, msgs, used, models in rows
+        ],
+    }, indent=2))
+    sys.exit(0)
+
+def htok(n):
+    for div, suffix in ((10**9, "B"), (10**6, "M"), (10**3, "K")):
+        if n >= div:
+            return "%.1f%s" % (n / div, suffix)
+    return str(n)
+
+ROW = "%-20s %6s %9s %9s %9s"
+print("Codex usage for %s, tokens only" % month)
+print()
+print(ROW % ("PROFILE", "TURNS", "INPUT", "OUTPUT", "OF WHICH"))
+print(ROW % ("", "", "", "", "CACHED"))
+for label, msgs, used, models in rows:
+    print(ROW % (label, msgs, htok(used["input"]), htok(used["output"]),
+                 htok(used["cached"])))
+    for name in sorted(models):
+        agg = models[name]
+        print(ROW % ("  " + name, "", htok(agg["input"]), htok(agg["output"]),
+                     htok(agg["cached"])))
+print()
+print("INPUT already includes the cached tokens, so those two columns do not")
+print("add up - Codex reports total_tokens as input + output alone.")
+print()
+print("Not priced: this script has no list-price table for these models, and")
+print("a guessed rate next to a real one is worse than no rate at all.")
+CODEXSPENDEOF
+            fi
             unset _cp_pairs _cp_d _cp_n
             return $_cp_rc
             ;;
@@ -790,6 +1299,27 @@ PYEOF
                     _cp_rc=1
                     ;;
             esac
+
+            # Codex is optional: not having it installed is not a failure, but
+            # having it installed with the wrapper shadowed is.
+            if command -v codex >/dev/null 2>&1; then
+                printf '  codex binary:  %s\n' "$(_codex_profile_bin)"
+                if [ -n "$ZSH_VERSION" ]; then
+                    _cp_kind=$(whence -w codex 2>/dev/null | awk '{print $2}')
+                else
+                    _cp_kind=$(type -t codex 2>/dev/null)
+                fi
+                case "$_cp_kind" in
+                    function) printf '  codex wrapper active (shell function)\n' ;;
+                    *)
+                        printf '  FAIL codex is "%s", not the claude-profiles function.\n' "${_cp_kind:-unknown}"
+                        printf '       codex -<name> will not switch profiles.\n'
+                        _cp_rc=1
+                        ;;
+                esac
+            else
+                printf '  codex binary:  not installed (Codex profiles unavailable)\n'
+            fi
 
             printf '\nRunning Claude processes:\n'
             _cp_stale=$(_claude_profile_stale_processes)
@@ -832,6 +1362,33 @@ PYEOF
                 printf '  SKIP could not create a probe directory\n'
             fi
 
+            # Codex's equivalent probe, and a cheaper one: `codex login
+            # status` against an empty home reports "Not logged in" without
+            # touching the network. If CODEX_HOME were being ignored it would
+            # instead report the default home's real account.
+            if command -v codex >/dev/null 2>&1; then
+                printf '\nCODEX_HOME still honoured:\n'
+                _cp_probe="${TMPDIR:-/tmp}/claude-profiles-codex-probe.$$"
+                if mkdir -p "$_cp_probe" 2>/dev/null; then
+                    _cp_out=$(CODEX_HOME="$_cp_probe" command codex login status 2>&1)
+                    case "$_cp_out" in
+                        *'Not logged in'*)
+                            printf '  yes — an empty CODEX_HOME reports no credentials\n'
+                            ;;
+                        *)
+                            printf '  FAIL an empty CODEX_HOME still reported: %s\n' "$_cp_out"
+                            printf '       Codex may be ignoring CODEX_HOME, in which case\n'
+                            printf '       codex -<name> is billing the default account.\n'
+                            _cp_rc=1
+                            ;;
+                    esac
+                    rm -rf "$_cp_probe"
+                else
+                    printf '  SKIP could not create a probe directory\n'
+                fi
+                unset _cp_probe _cp_out
+            fi
+
             printf '\nStatus line:\n'
             if [ -x "$CLAUDE_PROFILE_STATUS_BIN" ]; then
                 printf '  renderer present: %s\n' "$CLAUDE_PROFILE_STATUS_BIN"
@@ -853,7 +1410,11 @@ PYEOF
             # loop: the `|` puts the loop body in a subshell in most shells,
             # so an assignment made in there would not survive.
             _cp_issues=""
-            if [ -d "$CLAUDE_PROFILES_DIR" ]; then
+            # The emptiness test matters as much as the existence one: under
+            # zsh `for x in dir/*` is a hard error when the glob matches
+            # nothing, so a fresh install with no profiles would abort here.
+            if [ -d "$CLAUDE_PROFILES_DIR" ] &&
+                [ -n "$(find "$CLAUDE_PROFILES_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)" ]; then
                 for _cp_d in "$CLAUDE_PROFILES_DIR"/*; do
                     [ -d "$_cp_d" ] || continue
                     _cp_n=$(basename "$_cp_d")
@@ -879,6 +1440,24 @@ PYEOF
                     else
                         printf '    shared config intact\n'
                     fi
+                    if _codex_profile_exists "$_cp_n"; then
+                        printf '    codex: %s\n' \
+                            "$(_codex_profile_account "$(_codex_profile_root)/$_cp_n")"
+                    fi
+                done
+            fi
+
+            # A Codex home with no matching Claude profile is legitimate, but
+            # it would otherwise go unlisted here entirely.
+            if [ -d "$(_codex_profile_root)" ] &&
+                [ -n "$(find "$(_codex_profile_root)" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)" ]; then
+                for _cp_d in "$(_codex_profile_root)"/*; do
+                    [ -d "$_cp_d" ] || continue
+                    _cp_n=$(basename "$_cp_d")
+                    _codex_profile_exists "$_cp_n" || continue
+                    _claude_profile_exists "$_cp_n" && continue
+                    printf '  %s (codex only)\n' "$_cp_n"
+                    printf '    codex: %s\n' "$(_codex_profile_account "$_cp_d")"
                 done
             fi
             if [ -n "$_cp_issues" ]; then
@@ -943,6 +1522,12 @@ PYEOF
 
             # 2. Shared links, per profile. Never destroys a divergent copy.
             printf '\n'
+            if [ ! -d "$CLAUDE_PROFILES_DIR" ] ||
+                [ -z "$(find "$CLAUDE_PROFILES_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)" ]; then
+                printf 'No profiles yet.\n'
+                unset _cp_target _cp_bak
+                return 0
+            fi
             for _cp_d in "$CLAUDE_PROFILES_DIR"/*; do
                 [ -d "$_cp_d" ] || continue
                 _cp_n=$(basename "$_cp_d")
@@ -952,9 +1537,18 @@ PYEOF
                     *) continue ;;
                 esac
                 printf '%s:\n' "$_cp_n"
-                _cp_did=$(_claude_profile_shared_items | while IFS= read -r _cp_item; do
-                    _claude_profile_link_item "$_cp_d" "$_cp_item"
-                done)
+                _cp_did=$(
+                    _claude_profile_shared_items | while IFS= read -r _cp_item; do
+                        _claude_profile_link_item "$_cp_d" "$_cp_item"
+                    done
+                    if [ -d "$(_codex_profile_root)/$_cp_n" ]; then
+                        _claude_profile_shared_items "$CODEX_PROFILE_SHARED" |
+                            while IFS= read -r _cp_item; do
+                                _claude_profile_link_item \
+                                    "$(_codex_profile_root)/$_cp_n" "$_cp_item" "$HOME/.codex"
+                            done
+                    fi
+                )
                 if [ -n "$_cp_did" ]; then
                     printf '%s\n' "$_cp_did" | sed 's/^/  /'
                 else
@@ -965,10 +1559,20 @@ PYEOF
             ;;
 
         path)
-            _cp_dir=$(_claude_profile_dir "$1") || {
+            # path <name> [claude|codex] — defaults to claude, which is what
+            # every existing script calling this expects.
+            case "${2:-claude}" in
+                claude) _cp_dir=$(_claude_profile_dir "$1") ;;
+                codex) _cp_dir=$(_codex_profile_home "$1") ;;
+                *)
+                    printf 'claude-profile: unknown runtime "%s" (want claude or codex)\n' "$2" >&2
+                    return 1
+                    ;;
+            esac
+            if [ -z "$_cp_dir" ]; then
                 printf 'claude-profile: invalid profile name\n' >&2
                 return 1
-            }
+            fi
             printf '%s\n' "$_cp_dir"
             unset _cp_dir
             ;;
@@ -988,11 +1592,27 @@ PYEOF
 
 # --- completion --------------------------------------------------------------
 
+# Completion candidates. This filters on _claude_profile_valid_name as well as
+# the reserved-directory list, because the profiles directory now also holds
+# the hidden ".codex" tree — and a name starting with a dot is exactly what
+# that validator rejects. Without it, completion would offer "-.codex".
 _claude_profiles_names() {
     [ -d "$CLAUDE_PROFILES_DIR" ] || return 0
     find "$CLAUDE_PROFILES_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null |
         while IFS= read -r _cp_d; do
             _cp_b=$(basename "$_cp_d")
+            _claude_profile_valid_name "$_cp_b" || continue
+            _claude_profile_is_reserved_dir "$_cp_b" || printf '%s\n' "$_cp_b"
+        done
+}
+
+# The same candidates, for `codex -<name>`.
+_codex_profiles_names() {
+    [ -d "$(_codex_profile_root)" ] || return 0
+    find "$(_codex_profile_root)" -mindepth 1 -maxdepth 1 -type d 2>/dev/null |
+        while IFS= read -r _cp_d; do
+            _cp_b=$(basename "$_cp_d")
+            _claude_profile_valid_name "$_cp_b" || continue
             _claude_profile_is_reserved_dir "$_cp_b" || printf '%s\n' "$_cp_b"
         done
 }
@@ -1004,9 +1624,16 @@ if [ -n "$ZSH_VERSION" ]; then
         [ ${#names} -eq 0 ] && return 1
         compadd -P '-' -- $names
     }
+    _codex_profiles_complete() {
+        local -a names
+        names=(${(f)"$(_codex_profiles_names)"})
+        [ ${#names} -eq 0 ] && return 1
+        compadd -P '-' -- $names
+    }
     # compdef only exists once compinit has run; ignore failure if it hasn't.
     if whence compdef >/dev/null 2>&1; then
         compdef _claude_profiles_complete claude 2>/dev/null
+        compdef _codex_profiles_complete codex 2>/dev/null
     fi
 elif [ -n "$BASH_VERSION" ]; then
     _claude_profiles_complete_bash() {
@@ -1020,5 +1647,17 @@ elif [ -n "$BASH_VERSION" ]; then
             COMPREPLY=($(compgen -P '-' -W "$names" -- "${cur#-}"))
         fi
     }
+    _codex_profiles_complete_bash() {
+        local cur="${COMP_WORDS[COMP_CWORD]}"
+        if [ "$COMP_CWORD" -eq 1 ] && [ "${cur#-}" != "$cur" ]; then
+            local names
+            names=$(_codex_profiles_names)
+            # Word splitting is intended here; profile names cannot contain
+            # whitespace (see _claude_profile_valid_name).
+            # shellcheck disable=SC2207
+            COMPREPLY=($(compgen -P '-' -W "$names" -- "${cur#-}"))
+        fi
+    }
     complete -F _claude_profiles_complete_bash claude 2>/dev/null
+    complete -F _codex_profiles_complete_bash codex 2>/dev/null
 fi
