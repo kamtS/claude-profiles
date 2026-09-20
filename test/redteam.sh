@@ -69,6 +69,30 @@ fi
 STUB
     chmod +x "$SB/bin/claude"
 
+    # Stub Codex: reports the home it was handed, and advertises its own
+    # single-dash flags — including -p, which Codex uses for its *config*
+    # profiles and which must therefore still reach it untouched.
+    cat > "$SB/bin/codex" <<'STUB'
+#!/usr/bin/env bash
+echo "STUB|CODEX_HOME=${CODEX_HOME:-<unset>}|args:$*|profile=${CLAUDE_PROFILE:-<unset>}"
+if [ "${1:-}" = "--help" ]; then
+    printf 'Options:\n  -m, --model\n  -p, --profile\n  -codexonly, --codex-only  hypothetical\n'
+fi
+if [ "${1:-}" = "login" ] && [ "${2:-}" = "status" ]; then
+    echo "Not logged in"
+    exit 1
+fi
+STUB
+    chmod +x "$SB/bin/codex"
+
+    # Codex-side shared config, and its own canaries.
+    mkdir -p "$SB/home/.codex/skills"
+    echo "REAL_AGENTS" > "$SB/home/.codex/AGENTS.md"
+    echo "REAL_CODEX_SKILL" > "$SB/home/.codex/skills/keep.txt"
+    # Present precisely so the suite can prove it is NOT shared: config.toml
+    # is where Codex keeps env_key and MCP server definitions.
+    printf 'env_key = "OPENAI_API_KEY"\n' > "$SB/home/.codex/config.toml"
+
     # run <shell code> -> stdout+stderr
     run() {
         HOME="$SB/home" PATH="$SB/bin:$PATH" \
@@ -176,8 +200,11 @@ $1" 2>&1
     out=$(HOME="$SB/home" PATH="$SB/minbin:$SB/bin" \
         CLAUDE_PROFILES_DIR="$SB/home/.claude-profiles" \
         "$sh_abs" -c ". '$SRC'; claude-profile ls" 2>&1)
+    # type -P forces a PATH search. `command -v` would answer from bash's
+    # command hash instead, reporting a python3 that this PATH cannot reach
+    # as soon as anything earlier in this script has run one.
     assert_not_contains "python3 really is absent" "python3-was-found" \
-        "$(PATH="$SB/minbin:$SB/bin" command -v python3 >/dev/null 2>&1 && echo python3-was-found)"
+        "$(PATH="$SB/minbin:$SB/bin" type -P python3 >/dev/null 2>&1 && echo python3-was-found)"
     assert_contains "grep fallback finds email" "fallback@example.com" "$out"
 
     # The deletion section above removed "work"; recreate it for what follows.
@@ -353,8 +380,13 @@ JSONL
 {"type":"assistant","timestamp":"2026-01-20T10:00:00.000Z","requestId":"req_2","message":{"id":"msg_2","model":"claude-sonnet-5","usage":{"input_tokens":0,"output_tokens":1000000,"cache_read_input_tokens":10000000,"cache_creation":{"ephemeral_5m_input_tokens":1000000,"ephemeral_1h_input_tokens":1000000}}}}
 JSONL
         out=$(run "claude-profile spend 2026-01")
+        # Single quotes are deliberate: these are literal dollar amounts to
+        # match in the output, not expressions to expand.
+        # shellcheck disable=SC2016
         assert_contains "spend prices the default profile" '$30.00' "$out"
+        # shellcheck disable=SC2016
         assert_contains "spend prices the work profile" '$27.75' "$out"
+        # shellcheck disable=SC2016
         assert_contains "spend totals across profiles" '$57.75' "$out"
         assert_not_contains "spend excludes other months" "9.0M" "$out"
         assert_contains "spend says it is a list-price figure" "list rates" "$out"
@@ -370,6 +402,115 @@ JSONL
     else
         printf '  SKIP  python3 not installed\n'
     fi
+
+    printf '\n-- codex: profile isolation --\n'
+    out=$(run "claude-profile new cx </dev/null")
+    assert_contains "new creates a codex home" "codex home:" "$out"
+    assert_contains "new shares AGENTS.md" "linked AGENTS.md" "$out"
+    assert_not_contains "new does not share config.toml" "config.toml" "$out"
+    out=$(run "ls -1a \"\$CLAUDE_PROFILES_DIR/.codex/cx\"")
+    assert_contains "codex home has AGENTS.md" "AGENTS.md" "$out"
+    assert_not_contains "codex home has no config.toml" "config.toml" "$out"
+    assert_not_contains "codex home has no auth.json link" "auth.json" "$out"
+
+    out=$(run "codex -cx chat")
+    assert_contains "codex profile sets CODEX_HOME" "/.claude-profiles/.codex/cx|args:chat" "$out"
+    assert_contains "codex profile exports CLAUDE_PROFILE" "profile=cx" "$out"
+
+    out=$(run "codex chat")
+    assert_contains "bare codex leaves CODEX_HOME alone" "CODEX_HOME=<unset>|args:chat" "$out"
+
+    printf '\n-- codex: never silently falls back --\n'
+    out=$(run "codex -nosuch; echo exit=\$?")
+    assert_contains "unknown codex profile refuses" "Refusing to fall back" "$out"
+    assert_contains "unknown codex profile exits 2" "exit=2" "$out"
+    assert_not_contains "unknown codex profile never runs codex" "STUB|CODEX_HOME" "$out"
+
+    printf '\n-- codex: real flags must pass through --\n'
+    for flag in -m -c -h -i -s -a --help --version; do
+        out=$(run "codex $flag")
+        assert_contains "codex flag $flag untouched" "CODEX_HOME=<unset>|args:$flag" "$out"
+    done
+    # -p is Codex's own config-profile flag. Swallowing it would silently
+    # change which config.toml layer a session runs with.
+    out=$(run "codex -p fast")
+    assert_contains "codex -p reaches codex" "CODEX_HOME=<unset>|args:-p fast" "$out"
+    out=$(run "codex -codexonly")
+    assert_contains "unknown-but-real codex flag passes" "CODEX_HOME=<unset>|args:-codexonly" "$out"
+
+    printf '\n-- codex: path traversal --\n'
+    for bad in ".." "../../OUTSIDE" "/" "." "-dashy"; do
+        out=$(run "codex '-$bad' 2>&1; echo exit=\$?")
+        assert_not_contains "codex never resolves '-$bad' to a home" \
+            "CODEX_HOME=$SB" "$out"
+    done
+    assert_contains "outside canary survives codex traversal" "OUTSIDE_CANARY" \
+        "$(cat "$SB/OUTSIDE/canary.txt" 2>&1)"
+
+    printf '\n-- codex: account shown, tokens never printed --\n'
+    # A static id_token: base64url({"alg":"RS256"}).base64url({"email":...}).sig
+    # Written literally rather than generated, so this suite never invokes
+    # python3 itself — see the command-hash note in the fallback test above.
+    cat > "$SB/home/.claude-profiles/.codex/cx/auth.json" <<'MKAUTH'
+{"auth_mode": "chatgpt",
+ "tokens": {"id_token": "eyJhbGciOiJSUzI1NiJ9.eyJlbWFpbCI6ImNvZGV4QGV4YW1wbGUuY29tIn0.SIGNATUREBLOB",
+            "access_token": "ACCESSTOKENBLOB",
+            "refresh_token": "REFRESHTOKENBLOB"}}
+MKAUTH
+    out=$(run "claude-profile ls")
+    assert_contains "ls shows the codex account" "codex@example.com" "$out"
+    assert_not_contains "ls never prints the access token" "ACCESSTOKENBLOB" "$out"
+    assert_not_contains "ls never prints the refresh token" "REFRESHTOKENBLOB" "$out"
+    assert_not_contains "ls never prints the signature" "SIGNATUREBLOB" "$out"
+
+    printf '\n-- codex: a profile may exist for one runtime only --\n'
+    mkdir -p "$SB/home/.claude-profiles/.codex/codexonly"
+    out=$(run "claude-profile ls")
+    assert_contains "codex-only profile is listed" "-codexonly" "$out"
+    assert_contains "codex-only profile has no claude side" "(none)" "$out"
+    out=$(run "codex -codexonly go")
+    assert_contains "codex-only profile is usable" "/.codex/codexonly|args:go" "$out"
+
+    printf '\n-- codex: .codex is not itself a profile --\n'
+    out=$(run "claude-profile ls")
+    assert_not_contains "ls does not list .codex as a profile" "-.codex" "$out"
+    out=$(run "_claude_profiles_names")
+    assert_not_contains "completion does not offer .codex" ".codex" "$out"
+    out=$(run "claude -.codex 2>&1; echo exit=\$?")
+    assert_not_contains "cannot run the .codex directory as a profile" "CLAUDE_CONFIG_DIR=$SB/home/.claude-profiles/.codex|" "$out"
+
+    printf '\n-- codex: path and exec --\n'
+    out=$(run "claude-profile path cx codex")
+    assert_contains "path reports the codex home" "/.claude-profiles/.codex/cx" "$out"
+    out=$(run "claude-profile path cx")
+    assert_contains "path still defaults to claude" "/.claude-profiles/cx" "$out"
+    out=$(run "claude-profile path cx bogusruntime; echo exit=\$?")
+    assert_contains "path rejects an unknown runtime" "exit=1" "$out"
+    out=$(run "claude-profile exec cx -- codex go")
+    assert_contains "exec sets CODEX_HOME too" "/.claude-profiles/.codex/cx|args:go" "$out"
+    out=$(run "claude-profile exec cx -- claude go")
+    assert_contains "exec still sets CLAUDE_CONFIG_DIR" "/.claude-profiles/cx|args:go" "$out"
+
+    printf '\n-- codex: deletion removes both sides --\n'
+    out=$(run "printf 'cx\n' | claude-profile rm cx")
+    assert_contains "rm deletes the profile" 'Deleted "cx"' "$out"
+    out=$(run "ls -1a \"\$CLAUDE_PROFILES_DIR/.codex\"")
+    assert_not_contains "codex home gone after delete" "cx" "$out"
+    assert_contains "shared AGENTS.md intact" "REAL_AGENTS" "$(cat "$SB/home/.codex/AGENTS.md" 2>&1)"
+    assert_contains "shared codex skill intact" "REAL_CODEX_SKILL" "$(cat "$SB/home/.codex/skills/keep.txt" 2>&1)"
+
+    printf '\n-- codex: doctor and audit --\n'
+    out=$(run "claude-profile doctor")
+    assert_contains "doctor checks the codex wrapper" "codex wrapper active" "$out"
+    assert_contains "doctor probes CODEX_HOME" "CODEX_HOME still honoured" "$out"
+    out=$(run "claude-profile audit; echo exit=\$?")
+    assert_contains "audit lists the codex shared list" "Shared list (codex)" "$out"
+    assert_contains "clean codex audit exits 0" "exit=0" "$out"
+    printf 'sk-ant-AAAAAAAAAAAAAAAAAAAA\n' > "$SB/home/.codex/AGENTS.md"
+    out=$(run "claude-profile audit; echo exit=\$?")
+    assert_contains "audit flags a secret in shared codex config" "AGENTS.md" "$out"
+    assert_contains "dirty codex audit exits 1" "exit=1" "$out"
+    echo "REAL_AGENTS" > "$SB/home/.codex/AGENTS.md"
 
     printf '\n-- usage --\n'
     out=$(run "claude-profile bogus; echo exit=\$?")

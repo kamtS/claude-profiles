@@ -1,20 +1,24 @@
 # claude-profiles
 
-Run [Claude Code](https://claude.com/claude-code) against multiple workspace logins from one terminal, by prefixing a profile name:
+Run [Claude Code](https://claude.com/claude-code) and [Codex](https://developers.openai.com/codex/cli) against multiple workspace logins from one terminal, by prefixing a profile name:
 
 ```console
 $ claude -work        # your employer's workspace
 $ claude -clientx     # a client's workspace
 $ claude              # your personal account, unchanged
+
+$ codex -clientx      # same client, other runtime, its own login
 ```
 
-No re-login, no logging out and back in, no second machine.
+No re-login, no logging out and back in, no second machine. One profile name means the same client in both runtimes.
 
 ## Why
 
 Claude Code stores one active login at a time. If you have a personal subscription and a work workspace — or you consult across several client organisations — switching means logging out and back in, which also throws away that workspace's MCP server auth and session history.
 
 Claude Code does respect a `CLAUDE_CONFIG_DIR` environment variable that relocates its entire config directory. `claude-profiles` is a small shell wrapper around that: each profile is its own config directory, so each keeps its own credentials, MCP servers, project state and history. On macOS the system keychain namespaces Claude Code's credentials per config directory, so the logins never collide.
+
+Codex has the same escape hatch in `CODEX_HOME`, and is in one respect simpler: it keeps credentials in `auth.json` inside that home rather than in the keychain, so a separate home is a separate login with nothing shared at all. Codex support is optional — if `codex` isn't on your `PATH`, nothing about the Claude side changes.
 
 It's a couple of hundred lines of shell. No daemon, no dependencies, nothing to trust beyond a file you can read in one sitting.
 
@@ -37,7 +41,7 @@ $ claude-profile repair
 
 Prefer to do it by hand? Copy `claude-profiles.sh` anywhere and source it from your shell rc. That's the whole install.
 
-**Requires** Claude Code on your `PATH`, and bash or zsh. Tested on macOS; the config-directory mechanism works on Linux too, but credentials there live in a file rather than a keychain (see [Security notes](#security-notes)).
+**Requires** Claude Code on your `PATH`, and bash or zsh. Codex is optional; install it and the `codex -<name>` wrapper starts working. Tested on macOS; the config-directory mechanism works on Linux too, but credentials there live in a file rather than a keychain (see [Security notes](#security-notes)).
 
 ## Use
 
@@ -45,23 +49,28 @@ Prefer to do it by hand? Copy `claude-profiles.sh` anywhere and source it from y
 $ claude-profile new work
 ```
 
-Creates the profile and drops you into Claude Code so you can log in as that workspace. Then:
+Creates the profile and drops you into Claude Code so you can log in as that workspace. If Codex is installed it also creates that profile's Codex home and offers to log you in there — a separate account, on the same name. Then:
 
 ```console
 $ claude -work                       # interactive session
 $ claude -work -p "summarise this"   # flags pass through untouched
 $ claude -work --model sonnet
+
+$ codex -work                        # the same profile, under Codex
+$ codex -work -m gpt-5.5             # Codex's own flags pass through too
 ```
 
 List what you have:
 
 ```console
 $ claude-profile ls
-PROFILE          ACCOUNT
-(default)        you@personal.example
--work            you@employer.example
--clientx         you@clientx.example
+PROFILE          CLAUDE                             CODEX
+(default)        you@personal.example               you@personal.example
+-work            you@employer.example               you@employer.example
+-clientx         you@clientx.example                (none)
 ```
+
+A profile can exist for one runtime and not the other; `(none)` is that, and it is a normal state rather than a fault.
 
 Remove one:
 
@@ -69,7 +78,7 @@ Remove one:
 $ claude-profile rm clientx
 ```
 
-You'll be asked to type the profile name to confirm. Tab completion for `claude -<TAB>` is set up automatically in both shells.
+You'll be asked to type the profile name to confirm — and both runtimes' directories go together. Tab completion for `claude -<TAB>` and `codex -<TAB>` is set up automatically in both shells.
 
 ### Always know which profile you're in
 
@@ -109,6 +118,19 @@ PROFILE                MSGS     INPUT    OUTPUT  CACHE WR  CACHE RD       SPEND
 TOTAL                                                                   $913.51
 ```
 
+When Codex is installed, its usage is reported underneath in a second table:
+
+```console
+Codex usage for 2026-09, tokens only
+
+PROFILE               TURNS     INPUT    OUTPUT  OF WHICH
+                                                   CACHED
+(default)             25115      2.3B      6.5M      2.2B
+  gpt-5.6-sol                    1.6B      4.9M      1.6B
+```
+
+**Tokens, not dollars.** There is no list-price table here for the models Codex actually runs, and a guessed rate sitting next to a real one is worse than no rate at all. The token counts come from each rollout's cumulative `total_token_usage` rather than by summing the per-turn figures, which overcount by 2–5% because Codex emits more than one event for some turns. `INPUT` already includes the cached tokens, so those columns don't add up — that's Codex's own accounting, where `total_tokens` is input plus output alone.
+
 Pass a month to look back (`claude-profile spend 2026-07`), `--models` to break each profile down by model, or `--json` for scripts and dashboards. Messages duplicated by resumed sessions are counted once, and cache writes and reads are priced at their own rates.
 
 Two honest caveats. Subscription plans aren't billed per token, so the figure is the **pay-as-you-go list-price equivalent** — what the same usage would have cost on the API. That's still the number you want for comparing profiles, months, or "was this month heavier than last?". And it's computed from the transcripts on this machine: sessions run elsewhere (claude.ai, another laptop) aren't in it. Requires `python3`.
@@ -133,6 +155,14 @@ When a profile is created, these are symlinked back to your default `~/.claude` 
 settings.json  skills  agents  commands  plugins  CLAUDE.md
 ```
 
+And for Codex, back to `~/.codex`:
+
+```
+AGENTS.md  skills  prompts  rules  plugins
+```
+
+Two deliberate omissions on the Codex side. `config.toml` is never shared, because it holds `env_key` and MCP server definitions — the settings that hand a session credentials. `memories` is never shared either: it's accumulated per-client context rather than configuration, and sharing it would leak one client's working notes into another client's session, which is the thing profiles exist to prevent.
+
 **Nothing in that list may carry credentials.** A shared file is loaded into every client's session, so a secret inside one means you're running one client's work with another client's key in scope — the account isolation quietly leaking a level down. `claude-profile audit` checks for exactly that and exits non-zero if it finds anything:
 
 ```console
@@ -150,6 +180,7 @@ Anything absent is skipped. To change the list, set `CLAUDE_PROFILE_SHARED` befo
 ```sh
 CLAUDE_PROFILE_SHARED="settings.json skills"   # share less
 CLAUDE_PROFILE_SHARED=""                       # fully standalone profiles
+CODEX_PROFILE_SHARED="AGENTS.md"               # the Codex list, same rules
 ```
 
 Existing profiles aren't retroactively changed at `new` time — but `claude-profile repair` brings them up to date, and never destroys anything to do it (see below).
@@ -186,21 +217,26 @@ Deliberately, so workspaces stay properly separate:
 ```sh
 claude -work chat
   → CLAUDE_CONFIG_DIR=~/.claude-profiles/work command claude chat
+
+codex -work chat
+  → CODEX_HOME=~/.claude-profiles/.codex/work command codex chat
 ```
 
-That's it. The wrapper claims a leading `-name` argument **only when `~/.claude-profiles/name` actually exists as a directory**, so every real Claude Code flag — `-c`, `-p`, `-d`, `-r`, `-v`, `-w` — passes straight through.
+That's it. The wrapper claims a leading `-name` argument **only when that profile actually exists as a directory**, so every real Claude Code flag — `-c`, `-p`, `-d`, `-r`, `-v`, `-w` — passes straight through. The same holds for Codex's own flags, `-p` included: Codex uses `-p` for its *config* profiles (layering `$CODEX_HOME/<name>.config.toml`), which are a different concept from these account profiles, and it reaches Codex untouched.
+
+Codex homes live in a hidden `.codex` directory alongside the Claude profiles, so one directory holds everything worth backing up and one name means the same client in both runtimes. The leading dot is what keeps it from being mistaken for a profile: names must start with a letter or digit, so `.codex` can never be one.
 
 An unmatched `-foo` is a **hard error**, not a fallback:
 
 ```console
 $ claude -clientx
-claude-profile: no profile "clientx" in ~/.claude-profiles
+claude-profile: no claude profile "clientx" in ~/.claude-profiles
 Refusing to fall back to the default profile.
 ```
 
 Falling through to the default was the old behaviour, and it's the exact shape of the expensive mistake: rename a profile, move `CLAUDE_PROFILES_DIR`, restore a machine, or just mistype, and you'd bill your personal account without a word. Erroring is cheap; the alternative isn't.
 
-To avoid that check breaking a future Claude Code flag we've never heard of, an unmatched argument is looked up in `claude --help` before being rejected — so a genuine flag still passes through, and only a real typo errors. That lookup happens only on the failure path, so the normal case costs nothing.
+Both wrappers share one implementation of that rule, so it can't drift between them. To avoid the check breaking a future flag we've never heard of, an unmatched argument is looked up in that runtime's own `--help` before being rejected — so a genuine flag still passes through, and only a real typo errors. That lookup happens only on the failure path, so the normal case costs nothing.
 
 Profile names must start with a letter or digit and may contain only letters, digits, dot, underscore and hyphen. Single-character names are rejected because they would shadow short flags.
 
@@ -209,18 +245,19 @@ Profile names must start with a letter or digit and may contain only letters, di
 Worth knowing before you trust it with more than one account:
 
 - **Credential storage is Claude Code's, not ours.** This tool never reads, writes or moves credentials. It only sets an environment variable telling Claude Code which directory to use. On macOS, credentials go to the login keychain under `Claude Code-credentials-<hash>`, where the hash derives from the config directory — that's what keeps profiles from overwriting each other. On Linux they land in a file inside the profile directory; profile directories are created `700`.
-- **`ls` reads one field.** `claude-profile ls` reads `oauthAccount.emailAddress` from each profile's `.claude.json` purely to label rows. Nothing is sent anywhere.
+- **`ls` reads one field.** `claude-profile ls` reads `oauthAccount.emailAddress` from each profile's `.claude.json` purely to label rows. For Codex it decodes the unsigned payload of the `id_token` in `auth.json` and reads the `email` claim — that one claim, never the access or refresh tokens, which are not printed, logged or returned. Nothing is sent anywhere.
+- **Codex credentials are a file, not a keychain.** `auth.json` sits inside the profile's Codex home, which is created `700`. That makes Codex isolation simpler than Claude's, and it also means deleting a Codex profile really does delete its credentials — unlike the Claude side, where the keychain entry outlives `rm`.
 - **Deleting a profile deletes a directory of symlinks.** `rm -rf` removes symlinks themselves, never their targets, so your shared `~/.claude` config is not at risk. The path is validated to be a direct child of the profiles directory, and symlinked profile directories are refused outright.
 - **Keychain entries outlive `rm`.** Deleting a profile leaves its keychain credential entry behind. Remove it from Keychain Access if you want it gone. Erasing keychain items on your behalf felt like the wrong default for a tool this small.
 - **Shared symlinks mean shared trust.** A skill or plugin shared into every profile runs in every workspace. Worse, a shared file that *carries a secret* puts one client's credentials in every other client's session — account isolation leaking one level down. Run `claude-profile audit` before trusting the shared list, and again whenever you add to it. If you need a client profile that genuinely shares nothing, create it with `CLAUDE_PROFILE_SHARED=""`.
 - **The wrapper only exists in interactive shells.** Scripts, cron, CI, IDE extensions and the desktop app all bypass it and use the default profile. Use `claude-profile exec <name> -- ...` for the first three; for the last two, watch the status line.
 - **This is not a security boundary.** It separates *accounts*, not *privileges*. Anything running as your user can read every profile. Use separate OS user accounts if you need a real boundary.
 
-Profile names are validated against a strict allowlist and every path is quoted, so names containing shell metacharacters, `..`, or absolute paths are rejected rather than interpolated. The test suite (`test/redteam.sh`) covers path traversal, command injection, canary files that must survive deletion, hostile JSON, flag pass-through, the refusal to fall back to the default profile, status line identity and mismatch detection, credential auditing, and `repair` preserving a diverged file — in both bash and zsh.
+Profile names are validated against a strict allowlist and every path is quoted, so names containing shell metacharacters, `..`, or absolute paths are rejected rather than interpolated. The test suite (`test/redteam.sh`) covers path traversal, command injection, canary files that must survive deletion, hostile JSON, flag pass-through, the refusal to fall back to the default profile, status line identity and mismatch detection, credential auditing, and `repair` preserving a diverged file — in both bash and zsh. The Codex half adds its own coverage: that `CODEX_HOME` is set and unset in the right cases, that `config.toml` and `auth.json` are never shared into a profile, that token material never reaches `ls` output, that `.codex` is never treated as a profile, and that a profile can exist for one runtime alone.
 
 ## Unofficial
 
-Not affiliated with, endorsed by, or supported by Anthropic. It relies on `CLAUDE_CONFIG_DIR`, which is a documented Claude Code environment variable, but the rest is a shell convenience layer. If Claude Code ever ships native profile support, use that instead.
+Not affiliated with, endorsed by, or supported by Anthropic or OpenAI. It relies on `CLAUDE_CONFIG_DIR` and `CODEX_HOME`, both documented environment variables of their respective tools, but the rest is a shell convenience layer. If either ever ships native profile support, use that instead.
 
 ## Licence
 
