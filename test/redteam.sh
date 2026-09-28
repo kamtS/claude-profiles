@@ -512,6 +512,90 @@ MKAUTH
     assert_contains "dirty codex audit exits 1" "exit=1" "$out"
     echo "REAL_AGENTS" > "$SB/home/.codex/AGENTS.md"
 
+    printf '\n-- pre-set CLAUDE_PROFILE_SHARED survives sourcing --\n'
+    # run_pre <code before sourcing> <code after sourcing>
+    run_pre() {
+        HOME="$SB/home" PATH="$SB/bin:$PATH" \
+            CLAUDE_PROFILES_DIR="$SB/home/.claude-profiles" \
+            "$sh" -c "$1
+. '$SRC'
+$2" 2>&1
+    }
+    out=$(run_pre "CLAUDE_PROFILE_SHARED=''" "printf '[%s]\n' \"\$CLAUDE_PROFILE_SHARED\"")
+    assert_contains "explicit empty shared list is honoured" "[]" "$out"
+    out=$(run_pre "CLAUDE_PROFILE_SHARED='skills'" "printf '[%s]\n' \"\$CLAUDE_PROFILE_SHARED\"")
+    assert_contains "custom shared list is honoured" "[skills]" "$out"
+    out=$(run "printf '[%s]\n' \"\$CLAUDE_PROFILE_SHARED\"")
+    assert_contains "unset shared list keeps the default" "[settings.json skills agents commands plugins CLAUDE.md]" "$out"
+    out=$(run_pre "CLAUDE_PROFILE_SHARED=''" "claude-profile new standalone </dev/null; ls -1a \"\$CLAUDE_PROFILES_DIR/standalone\"")
+    assert_contains "standalone profile is created" 'Created profile "standalone"' "$out"
+    assert_not_contains "standalone profile shares no settings.json" "settings.json" "$out"
+    out=$(run_pre "CODEX_PROFILE_SHARED=''" "_claude_profile_shared_items \"\$CODEX_PROFILE_SHARED\"")
+    assert_not_contains "empty codex list does not fall back to the claude list" "settings.json" "$out"
+    out=$(run "printf 'standalone\n' | claude-profile rm standalone")
+
+    printf '\n-- traversal-shaped shared entries are skipped --\n'
+    for bad in "../../OUTSIDE/escaped" ".." "." "sub/dir"; do
+        out=$(run_pre "CLAUDE_PROFILE_SHARED='skills $bad'" "claude-profile new trav </dev/null")
+        assert_contains "new warns on shared entry '$bad'" "skipping unsafe shared entry \"$bad\"" "$out"
+        out=$(run "ls -1a \"\$CLAUDE_PROFILES_DIR/trav\" 2>&1")
+        assert_contains "legit entry still linked alongside '$bad'" "skills" "$out"
+        out=$(run_pre "CLAUDE_PROFILE_SHARED='skills $bad'" "claude-profile repair --all")
+        assert_contains "repair warns on shared entry '$bad'" "skipping unsafe shared entry" "$out"
+        out=$(run_pre "CLAUDE_PROFILE_SHARED='skills $bad'" "claude-profile audit")
+        assert_contains "audit warns on shared entry '$bad'" "skipping unsafe shared entry" "$out"
+        out=$(run "printf 'trav\n' | claude-profile rm trav")
+    done
+    # Set after sourcing too — the red team's original repro path.
+    out=$(run "CLAUDE_PROFILE_SHARED='../../OUTSIDE/escaped'; claude-profile new trav </dev/null")
+    assert_contains "post-source traversal entry is skipped" "skipping unsafe shared entry" "$out"
+    out=$(run "printf 'trav\n' | claude-profile rm trav")
+    assert_contains "no symlink escaped to \$SB/OUTSIDE" "absent" \
+        "$([ -e "$SB/OUTSIDE/escaped" ] || [ -L "$SB/OUTSIDE/escaped" ] && echo present || echo absent)"
+    assert_contains "no symlink escaped to \$HOME" "absent" \
+        "$([ -L "$SB/home/escaped" ] && echo present || echo absent)"
+
+    printf '\n-- zero-profile and codex-only states under %s --\n' "$sh"
+    local EMPTY="$SB/empty-profiles"
+    mkdir -p "$EMPTY/.codex/onlycodex"
+    run_empty() {
+        HOME="$SB/home" PATH="$SB/bin:$PATH" CLAUDE_PROFILES_DIR="$EMPTY" \
+            "$sh" -c ". '$SRC'
+$1" 2>&1
+    }
+    out=$(run_empty "claude-profile repair; echo exit=\$?")
+    assert_not_contains "repair: no nomatch with only hidden dirs" "no matches found" "$out"
+    assert_contains "repair reports no profiles" "No profiles yet" "$out"
+    out=$(run_empty "claude-profile doctor; echo exit=\$?")
+    assert_not_contains "doctor: no nomatch with only hidden dirs" "no matches found" "$out"
+    assert_contains "doctor still lists the codex-only home" "onlycodex (codex only)" "$out"
+    rm -rf "$EMPTY"; mkdir -p "$EMPTY"
+    mv "$SB/home/.claude.json" "$SB/home/.claude.json.hold"
+    out=$(run_empty "claude-profile audit; echo exit=\$?")
+    assert_not_contains "audit: no nomatch with an empty profiles dir" "no matches found" "$out"
+    assert_contains "audit says MCP check had nothing to inspect" "nothing to inspect" "$out"
+    mv "$SB/home/.claude.json.hold" "$SB/home/.claude.json"
+    rm -rf "$EMPTY"
+
+    printf '\n-- repair never wires a dangling statusLine renderer --\n'
+    local SETTINGS_HOLD
+    SETTINGS_HOLD=$(cat "$SB/home/.claude/settings.json")
+    rm -f "$SB/home/.claude/settings.json"
+    printf '{}\n' > "$SB/home/.claude/settings.json"
+    out=$(run_pre "CLAUDE_PROFILE_STATUS_BIN='$SB/nowhere/profile-status.sh'" "claude-profile repair; echo exit=\$?")
+    assert_contains "repair warns when the renderer is missing" "NOT wiring statusLine" "$out"
+    assert_contains "repair exits non-zero when the renderer is missing" "exit=1" "$out"
+    assert_not_contains "settings.json not given a dangling statusLine" "statusLine" \
+        "$(cat "$SB/home/.claude/settings.json")"
+    if command -v python3 >/dev/null 2>&1; then
+        out=$(run_pre "CLAUDE_PROFILE_STATUS_BIN='$STATUS_BIN'" "claude-profile repair; echo exit=\$?")
+        assert_contains "repair wires a renderer that exists" "Added statusLine" "$out"
+        assert_contains "settings.json points at the real renderer" "$STATUS_BIN" \
+            "$(cat "$SB/home/.claude/settings.json")"
+    fi
+    rm -f "$SB/home/.claude/settings.json" "$SB/home/.claude/settings.json.bak-"*
+    printf '%s\n' "$SETTINGS_HOLD" > "$SB/home/.claude/settings.json"
+
     printf '\n-- usage --\n'
     out=$(run "claude-profile bogus; echo exit=\$?")
     assert_contains "unknown command exits non-zero" "exit=1" "$out"
