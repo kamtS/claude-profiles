@@ -289,6 +289,9 @@ claude-profile — manage Claude Code workspace profiles
   claude-profile exec <name> [--] <cmd...>
                                run a command against a profile, for scripts
   claude-profile audit [name]  check shared config for credentials
+  claude-profile spend [YYYY-MM] [--models] [--json]
+                               the month's usage per profile, priced at
+                               Claude API list rates
   claude-profile doctor        check the install still works after an update
   claude-profile repair [name|--all]
                                restore shared links and the status line
@@ -496,6 +499,237 @@ claude-profile() {
                 fi
             done
             unset _cp_found _cp_j
+            return $_cp_rc
+            ;;
+
+        spend)
+            # What has each profile used this month, priced at Claude API
+            # list rates? Claude Code writes a JSONL transcript per session
+            # under <config dir>/projects/, and every assistant message in it
+            # carries the model and exact token counts — so the transcripts
+            # already are the ledger, and no extra state is ever kept.
+            #
+            # Subscription plans are not billed per token; the figure is the
+            # pay-as-you-go equivalent, which is still the honest way to
+            # compare profiles (and months) against each other.
+            if ! command -v python3 >/dev/null 2>&1; then
+                printf 'claude-profile: spend needs python3 to read the session transcripts.\n' >&2
+                return 1
+            fi
+            _cp_pairs=$(printf '(default)\t%s' "$HOME/.claude/projects")
+            if [ -d "$CLAUDE_PROFILES_DIR" ]; then
+                _cp_more=$(find "$CLAUDE_PROFILES_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null |
+                    sort | while IFS= read -r _cp_d; do
+                    _cp_n=$(basename "$_cp_d")
+                    _claude_profile_exists "$_cp_n" || continue
+                    printf -- '-%s\t%s\n' "$_cp_n" "$_cp_d/projects"
+                done)
+                [ -n "$_cp_more" ] && _cp_pairs="$_cp_pairs
+$_cp_more"
+                unset _cp_more
+            fi
+            CLAUDE_PROFILE_SPEND_DIRS="$_cp_pairs" python3 - "$@" <<'PYEOF'
+import json
+import os
+import sys
+from datetime import datetime
+
+def die(msg):
+    sys.stderr.write("claude-profile: %s\n" % msg)
+    sys.exit(1)
+
+month = None
+as_json = False
+by_model = False
+for arg in sys.argv[1:]:
+    if arg == "--json":
+        as_json = True
+    elif arg in ("--models", "-m"):
+        by_model = True
+    elif (len(arg) == 7 and arg[4] == "-"
+          and arg[:4].isdigit() and arg[5:].isdigit() and 1 <= int(arg[5:]) <= 12):
+        month = arg
+    else:
+        die("spend: unrecognised argument %r (expected YYYY-MM, --models or --json)" % arg)
+if month is None:
+    month = datetime.now().astimezone().strftime("%Y-%m")
+
+# USD per million tokens: (id fragment, input, output). First match wins, so
+# specific generations sit above their family fallback. Cache pricing hangs
+# off the input rate everywhere: 5-minute writes at 1.25x, 1-hour writes at
+# 2x, reads at 0.1x. Prices move rarely, but they do move — the list-price
+# table at https://platform.claude.com/docs/en/pricing is the reference.
+PRICES = (
+    ("fable-5", 10.0, 50.0),
+    ("mythos", 10.0, 50.0),
+    ("opus-4-1", 15.0, 75.0),
+    ("opus-4-0", 15.0, 75.0),
+    ("opus-4-2025", 15.0, 75.0),
+    ("3-opus", 15.0, 75.0),
+    ("opus", 5.0, 25.0),
+    ("sonnet", 3.0, 15.0),
+    ("3-5-haiku", 0.8, 4.0),
+    ("3-haiku", 0.25, 1.25),
+    ("haiku", 1.0, 5.0),
+)
+
+def rates(model):
+    for fragment, per_in, per_out in PRICES:
+        if fragment in model:
+            return per_in, per_out
+    return None
+
+def new_agg():
+    return {"msgs": 0, "input": 0, "output": 0,
+            "cache_w": 0, "cache_r": 0, "cost": 0.0}
+
+def bump(agg, tin, tout, c5m, c1h, crd, cost):
+    agg["msgs"] += 1
+    agg["input"] += tin
+    agg["output"] += tout
+    agg["cache_w"] += c5m + c1h
+    agg["cache_r"] += crd
+    agg["cost"] += cost
+
+profiles = []          # insertion order
+totals = {}            # profile -> aggregate
+model_totals = {}      # (profile, model) -> aggregate
+unpriced = set()
+seen = set()           # (message id, request id) — resumed sessions copy
+                       # their history into a fresh transcript, so the same
+                       # billed message can appear in several files.
+
+for pair in os.environ.get("CLAUDE_PROFILE_SPEND_DIRS", "").splitlines():
+    if "\t" not in pair:
+        continue
+    name, root = pair.split("\t", 1)
+    profiles.append(name)
+    totals[name] = new_agg()
+    if not os.path.isdir(root):
+        continue
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for fn in filenames:
+            if not fn.endswith(".jsonl"):
+                continue
+            try:
+                fh = open(os.path.join(dirpath, fn), encoding="utf-8",
+                          errors="replace")
+            except OSError:
+                continue
+            with fh:
+                for line in fh:
+                    # Cheap pre-filter: only assistant messages carry usage,
+                    # and most lines in a transcript are something else.
+                    if '"usage"' not in line or '"assistant"' not in line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except ValueError:
+                        continue
+                    if entry.get("type") != "assistant":
+                        continue
+                    msg = entry.get("message")
+                    if not isinstance(msg, dict):
+                        continue
+                    usage = msg.get("usage")
+                    if not isinstance(usage, dict):
+                        continue
+                    model = msg.get("model") or ""
+                    # "<synthetic>" marks locally generated filler, not a
+                    # billed API response.
+                    if not model or model.startswith("<"):
+                        continue
+                    ts = entry.get("timestamp") or ""
+                    try:
+                        stamp = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    except ValueError:
+                        continue
+                    if stamp.astimezone().strftime("%Y-%m") != month:
+                        continue
+                    key = (msg.get("id"), entry.get("requestId"))
+                    if key[0] is not None:
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                    tin = usage.get("input_tokens") or 0
+                    tout = usage.get("output_tokens") or 0
+                    crd = usage.get("cache_read_input_tokens") or 0
+                    creation = usage.get("cache_creation")
+                    if isinstance(creation, dict):
+                        c5m = creation.get("ephemeral_5m_input_tokens") or 0
+                        c1h = creation.get("ephemeral_1h_input_tokens") or 0
+                    else:
+                        c5m = usage.get("cache_creation_input_tokens") or 0
+                        c1h = 0
+                    r = rates(model)
+                    if r is None:
+                        unpriced.add(model)
+                        cost = 0.0
+                    else:
+                        per_in, per_out = r
+                        cost = (tin * per_in + tout * per_out
+                                + c5m * per_in * 1.25 + c1h * per_in * 2.0
+                                + crd * per_in * 0.1) / 1_000_000
+                    bump(totals[name], tin, tout, c5m, c1h, crd, cost)
+                    agg = model_totals.setdefault((name, model), new_agg())
+                    bump(agg, tin, tout, c5m, c1h, crd, cost)
+
+grand = sum(agg["cost"] for agg in totals.values())
+
+if as_json:
+    out = {"month": month, "total_usd": round(grand, 2), "profiles": []}
+    for name in profiles:
+        agg = totals[name]
+        out["profiles"].append({
+            "name": name,
+            "messages": agg["msgs"],
+            "input_tokens": agg["input"],
+            "output_tokens": agg["output"],
+            "cache_write_tokens": agg["cache_w"],
+            "cache_read_tokens": agg["cache_r"],
+            "spend_usd": round(agg["cost"], 2),
+            "models": {m: round(a["cost"], 2)
+                       for (p, m), a in sorted(model_totals.items())
+                       if p == name},
+        })
+    if unpriced:
+        out["unpriced_models"] = sorted(unpriced)
+    print(json.dumps(out, indent=2))
+    sys.exit(0)
+
+def htok(n):
+    for div, suffix in ((10**9, "B"), (10**6, "M"), (10**3, "K")):
+        if n >= div:
+            return "%.1f%s" % (n / div, suffix)
+    return str(n)
+
+ROW = "%-20s %6s %9s %9s %9s %9s %11s"
+print("Spend for %s, priced at Claude API list rates" % month)
+print()
+print(ROW % ("PROFILE", "MSGS", "INPUT", "OUTPUT", "CACHE WR", "CACHE RD", "SPEND"))
+for name in profiles:
+    agg = totals[name]
+    print(ROW % (name, agg["msgs"], htok(agg["input"]), htok(agg["output"]),
+                 htok(agg["cache_w"]), htok(agg["cache_r"]),
+                 "$%.2f" % agg["cost"]))
+    if by_model:
+        for (p, m), a in sorted(model_totals.items()):
+            if p == name:
+                print(ROW % ("  " + m, a["msgs"], htok(a["input"]),
+                             htok(a["output"]), htok(a["cache_w"]),
+                             htok(a["cache_r"]), "$%.2f" % a["cost"]))
+print(ROW % ("TOTAL", "", "", "", "", "", "$%.2f" % grand))
+print()
+print("Subscription plans are not billed per token; this is what the usage")
+print("would cost at pay-as-you-go API list rates.")
+if unpriced:
+    print()
+    print("Unrecognised models counted but priced at $0:")
+    for m in sorted(unpriced):
+        print("  " + m)
+PYEOF
+            _cp_rc=$?
+            unset _cp_pairs _cp_d _cp_n
             return $_cp_rc
             ;;
 
