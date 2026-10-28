@@ -314,8 +314,13 @@ JSONL
 {"type":"assistant","timestamp":"2026-01-20T10:00:00.000Z","requestId":"req_2","message":{"id":"msg_2","model":"claude-sonnet-5","usage":{"input_tokens":0,"output_tokens":1000000,"cache_read_input_tokens":10000000,"cache_creation":{"ephemeral_5m_input_tokens":1000000,"ephemeral_1h_input_tokens":1000000}}}}
 JSONL
         out=$(run "claude-profile spend 2026-01")
+        # Single quotes are deliberate: these are literal dollar amounts to
+        # match in the output, not expressions to expand.
+        # shellcheck disable=SC2016
         assert_contains "spend prices the default profile" '$30.00' "$out"
+        # shellcheck disable=SC2016
         assert_contains "spend prices the work profile" '$27.75' "$out"
+        # shellcheck disable=SC2016
         assert_contains "spend totals across profiles" '$57.75' "$out"
         assert_not_contains "spend excludes other months" "9.0M" "$out"
         assert_contains "spend says it is a list-price figure" "list rates" "$out"
