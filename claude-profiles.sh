@@ -42,7 +42,11 @@ CLAUDE_PROFILES_DIR="${CLAUDE_PROFILES_DIR:-$HOME/.claude-profiles}"
 # client's session. `claude-profile audit` enforces that. Note that MCP server
 # definitions — the usual place inline API keys and OAuth tokens end up — live
 # in .claude.json INSIDE each config dir and are never shared by this list.
-CLAUDE_PROFILE_SHARED="settings.json skills agents commands plugins CLAUDE.md"
+#
+# Set it before sourcing to override; an explicit empty value ("") means fully
+# standalone profiles and is honoured. `-`, not `:-`, is deliberate: `:-` would
+# treat "" as unset and silently share everything into an isolated profile.
+CLAUDE_PROFILE_SHARED="${CLAUDE_PROFILE_SHARED-settings.json skills agents commands plugins CLAUDE.md}"
 
 # Codex homes live in a hidden sibling directory of the Claude profile dirs,
 # so one profile name means the same client in both runtimes and a single
@@ -61,9 +65,12 @@ CODEX_PROFILES_SUBDIR=".codex"
 # `memories` is absent because it is accumulated per-client context rather
 # than configuration — sharing it would leak one client's working notes into
 # another client's session, which is the whole thing profiles exist to stop.
-CODEX_PROFILE_SHARED="AGENTS.md skills prompts rules plugins"
+CODEX_PROFILE_SHARED="${CODEX_PROFILE_SHARED-AGENTS.md skills prompts rules plugins}"
 
-# Where the statusLine renderer lives, relative to this script.
+# Where the statusLine renderer lives. This is where install.sh puts it — it is
+# NOT derived from wherever this script was sourced from, so a hand-install
+# that skips install.sh must set it explicitly (repair refuses to wire a
+# renderer that is not there).
 CLAUDE_PROFILE_STATUS_BIN="${CLAUDE_PROFILE_STATUS_BIN:-$CLAUDE_PROFILES_DIR/bin/profile-status.sh}"
 
 # --- internals ---------------------------------------------------------------
@@ -278,13 +285,28 @@ _ap_claim_profile() {
 }
 
 # Emit the shared-config entries, one per line. $1 is the space-separated
-# list, defaulting to the Claude one so existing callers are unchanged.
+# list, defaulting to the Claude one so existing callers are unchanged. The
+# default applies only when no argument is passed: an explicitly empty Codex
+# list must stay empty, not fall back to the Claude one.
 # Iterate via `tr` + `read`, NOT `for x in $CLAUDE_PROFILE_SHARED`: zsh does not
 # word-split unquoted scalars, so a plain `for` loop silently iterated nothing.
+#
+# Each entry becomes a path segment under a profile dir and under ~/.claude, so
+# anything that could escape either (".", "..", or anything containing "/") is
+# skipped with a warning on stderr rather than linked or scanned.
 _claude_profile_shared_items() {
-    printf '%s\n' "${1:-$CLAUDE_PROFILE_SHARED}" | tr ' ' '\n' | while IFS= read -r _cp_i; do
-        [ -n "$_cp_i" ] && printf '%s\n' "$_cp_i"
+    if [ $# -gt 0 ]; then _cp_list="$1"; else _cp_list="$CLAUDE_PROFILE_SHARED"; fi
+    printf '%s\n' "$_cp_list" | tr ' ' '\n' | while IFS= read -r _cp_i; do
+        case "$_cp_i" in
+            "") ;;
+            . | .. | */*)
+                printf 'claude-profile: skipping unsafe shared entry "%s" (must be a plain name)\n' \
+                    "$_cp_i" >&2
+                ;;
+            *) printf '%s\n' "$_cp_i" ;;
+        esac
     done
+    unset _cp_list
 }
 
 # Link one shared entry into a profile. $3 is the directory the canonical copy
@@ -837,7 +859,13 @@ claude-profile() {
                     fi
                 done
             )
-            [ -n "$_cp_iso" ] && printf '%s\n' "$_cp_iso"
+            # Say so when there was nothing to inspect, rather than printing an
+            # empty section a reader could mistake for a passed check.
+            if [ -n "$_cp_iso" ]; then
+                printf '%s\n' "$_cp_iso"
+            else
+                printf '  nothing to inspect (no ~/.claude.json and no profiles yet)\n'
+            fi
             case "$_cp_iso" in *'SHARED (!)'*) _cp_rc=1 ;; esac
 
             # The same question for Codex. config.toml is where its MCP server
@@ -1414,7 +1442,7 @@ CODEXSPENDEOF
             # zsh `for x in dir/*` is a hard error when the glob matches
             # nothing, so a fresh install with no profiles would abort here.
             if [ -d "$CLAUDE_PROFILES_DIR" ] &&
-                [ -n "$(find "$CLAUDE_PROFILES_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)" ]; then
+                [ -n "$(find "$CLAUDE_PROFILES_DIR" -mindepth 1 -maxdepth 1 -type d ! -name '.*' 2>/dev/null)" ]; then
                 for _cp_d in "$CLAUDE_PROFILES_DIR"/*; do
                     [ -d "$_cp_d" ] || continue
                     _cp_n=$(basename "$_cp_d")
@@ -1450,7 +1478,7 @@ CODEXSPENDEOF
             # A Codex home with no matching Claude profile is legitimate, but
             # it would otherwise go unlisted here entirely.
             if [ -d "$(_codex_profile_root)" ] &&
-                [ -n "$(find "$(_codex_profile_root)" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)" ]; then
+                [ -n "$(find "$(_codex_profile_root)" -mindepth 1 -maxdepth 1 -type d ! -name '.*' 2>/dev/null)" ]; then
                 for _cp_d in "$(_codex_profile_root)"/*; do
                     [ -d "$_cp_d" ] || continue
                     _cp_n=$(basename "$_cp_d")
@@ -1478,6 +1506,7 @@ CODEXSPENDEOF
 
         repair)
             _cp_target="${1:---all}"
+            _cp_rc_status=0
             printf 'Repairing shared config.\n\n'
 
             # 1. The status line, in the shared settings file so one entry
@@ -1487,6 +1516,15 @@ CODEXSPENDEOF
             fi
             if grep -q '"statusLine"' "$HOME/.claude/settings.json" 2>/dev/null; then
                 printf 'statusLine already present in ~/.claude/settings.json\n'
+            elif [ ! -x "$CLAUDE_PROFILE_STATUS_BIN" ]; then
+                # Wiring a command that does not exist would kill every
+                # session's status line silently — the profile label is the
+                # safety feature, so refuse loudly instead.
+                printf 'WARNING: NOT wiring statusLine: renderer missing or not executable:\n' >&2
+                printf '  %s\n' "$CLAUDE_PROFILE_STATUS_BIN" >&2
+                printf 'Run install.sh, or set CLAUDE_PROFILE_STATUS_BIN to the path of\n' >&2
+                printf 'bin/profile-status.sh before sourcing, then run repair again.\n' >&2
+                _cp_rc_status=1
             else
                 _cp_bak="$HOME/.claude/settings.json.bak-$(date +%Y%m%d%H%M%S)"
                 cp "$HOME/.claude/settings.json" "$_cp_bak" 2>/dev/null
@@ -1523,10 +1561,10 @@ PYEOF
             # 2. Shared links, per profile. Never destroys a divergent copy.
             printf '\n'
             if [ ! -d "$CLAUDE_PROFILES_DIR" ] ||
-                [ -z "$(find "$CLAUDE_PROFILES_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)" ]; then
+                [ -z "$(find "$CLAUDE_PROFILES_DIR" -mindepth 1 -maxdepth 1 -type d ! -name '.*' 2>/dev/null)" ]; then
                 printf 'No profiles yet.\n'
                 unset _cp_target _cp_bak
-                return 0
+                return $_cp_rc_status
             fi
             for _cp_d in "$CLAUDE_PROFILES_DIR"/*; do
                 [ -d "$_cp_d" ] || continue
@@ -1556,6 +1594,7 @@ PYEOF
                 fi
             done
             unset _cp_target _cp_d _cp_n _cp_did _cp_bak
+            return $_cp_rc_status
             ;;
 
         path)
