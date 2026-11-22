@@ -656,11 +656,13 @@ $1" 2>&1
     if command -v jq >/dev/null 2>&1; then
         mkdir -p "$SB/jq-only"
         ln -sf "$(command -v jq)" "$SB/jq-only/jq"
-        # /bin has the shell. python3 lives elsewhere, so this PATH takes the jq branch.
+        # Invoke the shell by absolute path. On Linux /bin is /usr/bin, so a
+        # PATH of "/bin" still contains python3 and the jq branch never runs.
+        shell_bin=$(command -v "$sh")
         printf '%s\n' '{"note":"statusLine"}' > "$SB/home/.claude/settings.json"
-        out=$(HOME="$SB/home" PATH="$SB/jq-only:/bin" \
+        out=$(HOME="$SB/home" PATH="$SB/jq-only" \
             CLAUDE_PROFILES_DIR="$SB/home/.claude-profiles" \
-            "$sh" -c ". '$SRC'
+            "$shell_bin" -c ". '$SRC'
 command -v python3 >/dev/null && echo HAS_PYTHON || echo NO_PYTHON
 command -v jq >/dev/null && echo HAS_JQ || echo NO_JQ
 if _claude_profile_has_statusline \"\$HOME/.claude/settings.json\"; then echo PRESENT; else echo ABSENT; fi")
@@ -668,9 +670,9 @@ if _claude_profile_has_statusline \"\$HOME/.claude/settings.json\"; then echo PR
         assert_contains "jq branch can see jq" "HAS_JQ" "$out"
         assert_contains "jq check ignores a statusLine string" "ABSENT" "$out"
         printf '%s\n' '{"statusLine":{"type":"command","command":"true"}}' > "$SB/home/.claude/settings.json"
-        out=$(HOME="$SB/home" PATH="$SB/jq-only:/bin" \
+        out=$(HOME="$SB/home" PATH="$SB/jq-only" \
             CLAUDE_PROFILES_DIR="$SB/home/.claude-profiles" \
-            "$sh" -c ". '$SRC'
+            "$shell_bin" -c ". '$SRC'
 if _claude_profile_has_statusline \"\$HOME/.claude/settings.json\"; then echo PRESENT; else echo ABSENT; fi")
         assert_contains "jq check sees a statusLine key" "PRESENT" "$out"
     fi
