@@ -288,6 +288,48 @@ $1" 2>&1
     assert_not_contains "audit never prints the secret itself" "sk-ant-api03-AAAA" "$out"
     rm -f "$SB/home/.claude/skills/leak.txt"
 
+    printf '\n-- audit recognises wider credential shapes --\n'
+    # Assembled at runtime. This file must not contain a scannable secret:
+    # scanners read the source, not the sandbox these pieces are joined in.
+    local aws_key oai_key gl_key pem_block
+    local aws_short oai_short gl_short pub_block
+    aws_key=$(printf '%s%s' 'AK' 'IA')
+    aws_key="${aws_key}$(printf 'Q%.0s' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16)"
+    oai_key=$(printf '%s%s' 'sk-' 'proj-')
+    oai_key="${oai_key}$(printf 'm%.0s' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20)"
+    gl_key=$(printf '%s%s' 'glpa' 't-')
+    gl_key="${gl_key}$(printf 'n%.0s' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20)"
+    pem_block=$(printf '%s%s%s%s%s\n%s\n%s%s%s%s\n' \
+        '-----' 'BEGIN ' 'PRI' 'VATE ' 'KEY-----' \
+        'MPEMBODY' \
+        '-----' 'END ' 'PRI' 'VATE KEY-----')
+    aws_short=$(printf '%s%s' 'AK' 'IA')
+    aws_short="${aws_short}$(printf 'Q%.0s' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15)"
+    oai_short=$(printf '%s%s' 'sk-' 'proj-')
+    oai_short="${oai_short}$(printf 'm%.0s' 1 2 3 4 5 6 7 8 9 10)"
+    gl_short=$(printf '%s%s' 'glpa' 't-')
+    gl_short="${gl_short}$(printf 'n%.0s' 1 2 3 4 5 6 7 8 9 10)"
+    pub_block=$(printf '%s%s%s%s\n' '-----' 'BEGIN ' 'PUB' 'LIC KEY-----')
+    printf '%s\n' "$aws_key" > "$SB/home/.claude/skills/aws.txt"
+    printf '%s\n' "$oai_key" > "$SB/home/.claude/skills/oai.txt"
+    printf '%s\n' "$gl_key" > "$SB/home/.claude/skills/gl.txt"
+    printf '%s\n' "$pem_block" > "$SB/home/.claude/skills/pem.txt"
+    printf '%s\n%s\n%s\n%s\n' "$aws_short" "$oai_short" "$gl_short" "$pub_block" \
+        > "$SB/home/.claude/skills/lookalike.txt"
+    out=$(run "claude-profile audit; echo exit=\$?")
+    assert_contains "audit flags an AWS access key id" "skills/aws.txt" "$out"
+    assert_contains "audit flags an OpenAI project key" "skills/oai.txt" "$out"
+    assert_contains "audit flags a GitLab token" "skills/gl.txt" "$out"
+    assert_contains "audit flags a PEM private key" "skills/pem.txt" "$out"
+    assert_not_contains "audit ignores short and public-key lookalikes" "skills/lookalike.txt" "$out"
+    assert_not_contains "audit does not print the AWS sample" "$aws_key" "$out"
+    assert_not_contains "audit does not print the OpenAI sample" "$oai_key" "$out"
+    assert_not_contains "audit does not print the GitLab sample" "$gl_key" "$out"
+    assert_not_contains "audit does not print the PEM body" "MPEMBODY" "$out"
+    rm -f "$SB/home/.claude/skills/aws.txt" "$SB/home/.claude/skills/oai.txt" \
+        "$SB/home/.claude/skills/gl.txt" "$SB/home/.claude/skills/pem.txt" \
+        "$SB/home/.claude/skills/lookalike.txt"
+
     printf '\n-- doctor and repair survive an un-shared settings file --\n'
     # Exactly what an atomic temp-file-plus-rename settings write leaves
     # behind: the symlink is gone and the profile silently stopped sharing.
@@ -593,6 +635,63 @@ $1" 2>&1
         assert_contains "settings.json points at the real renderer" "$STATUS_BIN" \
             "$(cat "$SB/home/.claude/settings.json")"
     fi
+    rm -f "$SB/home/.claude/settings.json" "$SB/home/.claude/settings.json.bak-"*
+    printf '%s\n' "$SETTINGS_HOLD" > "$SB/home/.claude/settings.json"
+
+    printf '\n-- statusLine is a JSON key, not a substring --\n'
+    SETTINGS_HOLD=$(cat "$SB/home/.claude/settings.json")
+    printf '%s\n' '{"note":"the word statusLine is not a key"}' > "$SB/home/.claude/settings.json"
+    out=$(run "claude-profile doctor")
+    assert_contains "doctor rejects a statusLine string value" "FAIL no statusLine" "$out"
+    assert_not_contains "doctor does not call a string value wired" "wired into shared settings.json" "$out"
+    out=$(run "claude-profile new slword </dev/null")
+    assert_contains "new warns when statusLine is only a string" "no statusLine configured" "$out"
+    out=$(run_pre "CLAUDE_PROFILE_STATUS_BIN='$STATUS_BIN'" "claude-profile repair")
+    assert_not_contains "repair does not skip a statusLine string" "already present" "$out"
+    if command -v python3 >/dev/null 2>&1; then
+        assert_contains "repair writes a statusLine key past a string mention" "Added statusLine" "$out"
+        assert_contains "repair keeps the surrounding settings" "the word statusLine is not a key" \
+            "$(cat "$SB/home/.claude/settings.json")"
+    fi
+    if command -v jq >/dev/null 2>&1; then
+        mkdir -p "$SB/jq-only"
+        ln -sf "$(command -v jq)" "$SB/jq-only/jq"
+        # Invoke the shell by absolute path. On Linux /bin is /usr/bin, so a
+        # PATH of "/bin" still contains python3 and the jq branch never runs.
+        shell_bin=$(command -v "$sh")
+        printf '%s\n' '{"note":"statusLine"}' > "$SB/home/.claude/settings.json"
+        out=$(HOME="$SB/home" PATH="$SB/jq-only" \
+            CLAUDE_PROFILES_DIR="$SB/home/.claude-profiles" \
+            "$shell_bin" -c ". '$SRC'
+command -v python3 >/dev/null && echo HAS_PYTHON || echo NO_PYTHON
+command -v jq >/dev/null && echo HAS_JQ || echo NO_JQ
+if _claude_profile_has_statusline \"\$HOME/.claude/settings.json\"; then echo PRESENT; else echo ABSENT; fi")
+        assert_contains "jq branch has no python3" "NO_PYTHON" "$out"
+        assert_contains "jq branch can see jq" "HAS_JQ" "$out"
+        assert_contains "jq check ignores a statusLine string" "ABSENT" "$out"
+        printf '%s\n' '{"statusLine":{"type":"command","command":"true"}}' > "$SB/home/.claude/settings.json"
+        out=$(HOME="$SB/home" PATH="$SB/jq-only" \
+            CLAUDE_PROFILES_DIR="$SB/home/.claude-profiles" \
+            "$shell_bin" -c ". '$SRC'
+if _claude_profile_has_statusline \"\$HOME/.claude/settings.json\"; then echo PRESENT; else echo ABSENT; fi")
+        assert_contains "jq check sees a statusLine key" "PRESENT" "$out"
+    fi
+    cat > "$SB/home/.claude/settings.json" <<'EOF'
+{
+  "note": "statusLine mentioned in a string",
+  "statusLine": {
+    "type": "command",
+    "command": "true"
+  }
+}
+EOF
+    out=$(run "claude-profile doctor")
+    assert_contains "doctor accepts a pretty-printed statusLine key" "wired into shared settings.json" "$out"
+    assert_not_contains "doctor does not fail a real statusLine key" "FAIL no statusLine" "$out"
+    out=$(run "claude-profile new slkey </dev/null")
+    assert_not_contains "new stays quiet when the statusLine key exists" "no statusLine configured" "$out"
+    out=$(run_pre "CLAUDE_PROFILE_STATUS_BIN='$STATUS_BIN'" "claude-profile repair")
+    assert_contains "repair leaves an existing statusLine key" "already present" "$out"
     rm -f "$SB/home/.claude/settings.json" "$SB/home/.claude/settings.json.bak-"*
     printf '%s\n' "$SETTINGS_HOLD" > "$SB/home/.claude/settings.json"
 
