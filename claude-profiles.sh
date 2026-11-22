@@ -426,7 +426,11 @@ CODEXAUTHEOF
 # safe to paste into a ticket.
 _claude_profile_scan_secrets() {
     [ -e "$1" ] || return 0
-    grep -rIlE '(sk-ant-[A-Za-z0-9_-]{16}|ghp_[A-Za-z0-9]{16}|gho_[A-Za-z0-9]{16}|xoxb-[0-9]{8}|AIza[0-9A-Za-z_-]{30})' \
+    # Prefixes only, so a finding names a file and never a value: Anthropic,
+    # GitHub (pat and oauth), Slack bot, Google API, AWS access key id,
+    # OpenAI project key, GitLab personal access token, and a PEM private-key
+    # block (including RSA, EC, OPENSSH and ENCRYPTED forms).
+    grep -rIlE '(sk-ant-[A-Za-z0-9_-]{16}|ghp_[A-Za-z0-9]{16}|gho_[A-Za-z0-9]{16}|xoxb-[0-9]{8}|AIza[0-9A-Za-z_-]{30}|AKIA[0-9A-Z]{16}|sk-proj-[A-Za-z0-9_-]{20,}|glpat-[A-Za-z0-9_-]{20,}|-----BEGIN ([A-Z]+ )*PRIVATE KEY-----)' \
         "$1" 2>/dev/null | while IFS= read -r _cp_f; do
         printf '%s: hard-coded credential pattern\n' "$_cp_f"
     done
@@ -463,6 +467,33 @@ PYEOF
             ;;
     esac
     unset _cp_f
+}
+
+# True when $1 (a settings.json) has a statusLine *key*. A substring search
+# is the wrong test: a string value that merely mentions the word makes
+# `new` stay quiet, `repair` skip wiring, and `doctor` report the line as
+# present. python3 is the parser the rest of this script already uses; jq
+# covers a machine that has it and not python3. With neither, require the
+# key and its colon so a quoted value cannot match.
+_claude_profile_has_statusline() {
+    [ -f "$1" ] || return 1
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$1" <<'PYEOF' 2>/dev/null
+import json, sys
+try:
+    with open(sys.argv[1]) as fh:
+        data = json.load(fh)
+except Exception:
+    sys.exit(1)
+sys.exit(0 if isinstance(data, dict) and "statusLine" in data else 1)
+PYEOF
+        return $?
+    fi
+    if command -v jq >/dev/null 2>&1; then
+        jq -e 'type == "object" and has("statusLine")' "$1" >/dev/null 2>&1
+        return $?
+    fi
+    grep -qE '"statusLine"[[:space:]]*:' "$1" 2>/dev/null
 }
 
 # --- the wrapper -------------------------------------------------------------
@@ -645,7 +676,7 @@ claude-profile() {
             fi
 
             # Make sure the session will say which profile it is billing.
-            if ! grep -q '"statusLine"' "$HOME/.claude/settings.json" 2>/dev/null; then
+            if ! _claude_profile_has_statusline "$HOME/.claude/settings.json"; then
                 printf '\nNote: no statusLine configured, so sessions will not display\n'
                 printf 'which profile they are running as. Run: claude-profile repair\n'
             fi
@@ -1424,7 +1455,7 @@ CODEXSPENDEOF
                 printf '  FAIL renderer missing or not executable: %s\n' "$CLAUDE_PROFILE_STATUS_BIN"
                 _cp_rc=1
             fi
-            if grep -q '"statusLine"' "$HOME/.claude/settings.json" 2>/dev/null; then
+            if _claude_profile_has_statusline "$HOME/.claude/settings.json"; then
                 printf '  wired into shared settings.json\n'
             else
                 printf '  FAIL no statusLine in ~/.claude/settings.json — sessions will\n'
@@ -1514,7 +1545,7 @@ CODEXSPENDEOF
             if [ ! -f "$HOME/.claude/settings.json" ]; then
                 printf '{}\n' > "$HOME/.claude/settings.json"
             fi
-            if grep -q '"statusLine"' "$HOME/.claude/settings.json" 2>/dev/null; then
+            if _claude_profile_has_statusline "$HOME/.claude/settings.json"; then
                 printf 'statusLine already present in ~/.claude/settings.json\n'
             elif [ ! -x "$CLAUDE_PROFILE_STATUS_BIN" ]; then
                 # Wiring a command that does not exist would kill every
